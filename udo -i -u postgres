@@ -1,0 +1,8 @@
+[0;1;32m●[0m postgresql.service - PostgreSQL RDBMS
+     Loaded: loaded (]8;;file://aqvenskmgz/usr/lib/systemd/system/postgresql.service/usr/lib/systemd/system/postgresql.service]8;;; [0;1;32menabled[0m; preset: [0;1;32menabled[0m)
+     Active: [0;1;32mactive (exited)[0m since Fri 2025-08-01 10:56:43 UTC; 14s ago
+   Main PID: 41856 (code=exited, status=0/SUCCESS)
+        CPU: 1ms
+
+Aug 01 10:56:43 aqvenskmgz systemd[1]: Starting postgresql.service - PostgreSQL RDBMS...
+Aug 01 10:56:43 aqvenskmgz systemd[1]: Finished postgresql.service - PostgreSQL RDBMS.
