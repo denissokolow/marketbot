@@ -1,53 +1,33 @@
-const axios = require('axios');
+const { getOzonReport, getReturnsCount, formatMoney } = require('../ozon');
 
-async function getOzonReport(client_id, api_key, date, type = 'today', shop_name = '') {
-  let metrics = [];
-  if (type === 'today') {
-    metrics = ["revenue", "ordered_units"];
-  } else {
-    metrics = ["revenue", "ordered_units", "returns_sum", "cancellations_sum"];
-  }
+// Вынеси список метрик для отчета за вчера:
+const YESTERDAY_METRICS = ['revenue', 'ordered_units', 'cancellations_sum'];
 
-  const res = await axios.post(
-    'https://api-seller.ozon.ru/v1/analytics/data',
-    {
-      date_from: date,
-      date_to: date,
-      metrics,
-      dimension: ["day"],
-      filters: [],
-      limit: 1,
-      offset: 0
-    },
-    {
-      headers: {
-        "Client-Id": client_id,
-        "Api-Key": api_key,
-        "Content-Type": "application/json"
-      }
-    }
-  );
+async function makeYesterdayReportText(user, date) {
+  // Получить метрики (revenue, ordered_units, cancellations_sum)
+  const metrics = await getOzonReport({
+    client_id: user.client_id,
+    api_key: user.seller_api,
+    date,
+    metrics: YESTERDAY_METRICS
+  });
 
-  if (!res.data.result.data.length) {
-    return `🏪 Магазин: *${shop_name || "Неизвестно"}*\n📅 Отчет за ${date}\n\nНет данных за этот день.`;
-  }
+  // Получить число возвратов
+  const returns = await getReturnsCount({
+    client_id: user.client_id,
+    api_key: user.seller_api,
+    date
+  });
 
-  const values = res.data.result.data[0].metrics;
-  let result = `🏪 Магазин: *${shop_name || "Неизвестно"}*\n\n`;
-  result += `🕒 Отчет за *${date}*\n\n`;
-  result += `💰 Заказано на сумму: ${formatNum(values[0]) ?? '-'}₽\n\n`;
-  result += `📦 Заказано товаров: ${formatNum(values[1]) ?? '-'}\n`;
-  if (type === 'yesterday') {
-    result += `🔄 Возвраты: ${formatNum(values[2]) ?? '-'}\n`;
-    result += `❌ Отмены: ${formatNum(values[3]) ?? '-'}\n`;
-  }
+  let result = `🏪 Магазин: *${user.shop_name || "Неизвестно"}*\n`;
+  result += `📅 Отчет за ${date}\n\n`;
+  result += `💰 Заказано на сумму: ${formatMoney(metrics?.[0])}₽\n`;
+  result += `📦 Заказано товаров: ${metrics?.[1] ?? '-'}\n`;
+  result += `🔄 Возвраты: ${returns}\n`;
+  result += `❌ Отмены: ${metrics?.[2] ?? '-'}\n`;
+
   return result;
 }
 
-// Функция для форматирования чисел с пробелом
-function formatNum(num) {
-  if (num === undefined || num === null) return '-';
-  return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
-}
+module.exports = { makeYesterdayReportText };
 
-module.exports = { getOzonReport };
