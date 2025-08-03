@@ -1,26 +1,15 @@
 require('dotenv').config();
-const { Client } = require('pg');
 const { Telegraf, Markup } = require('telegraf');
 const cron = require('node-cron');
-const axios = require('axios');
-const cheerio = require('cheerio');
+const db = require('./db');
+const { getTodayReport, getYesterdayReport } = require('./ozon');
 
-// --- Подключение к БД ---
-const db = new Client({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  password: process.env.DB_PASSWORD,
-  port: Number(process.env.DB_PORT)
-});
+function getYesterdayISO() {
+  const d = new Date();
+  d.setDate(d.getDate() - 1);
+  return d.toISOString().slice(0, 10);
+}
 
-// --- Инициализация бота ---
-const bot = new Telegraf(process.env.BOT_TOKEN);
-
-// --- Хранилище этапов регистрации ---
-const usersAwaiting = {};
-
-// --- Главное меню ---
 function getMainMenu() {
   return Markup.keyboard([
     ['🔄 Прислать статус сейчас', '❓ Помощь'],
@@ -28,104 +17,105 @@ function getMainMenu() {
   ]).resize();
 }
 
-// --- Получение названия магазина через парсинг страницы Ozon ---
-async function getSellerName(client_id) {
-  const url = `https://www.ozon.ru/seller/${client_id}/`;
-  try {
-    const resp = await axios.get(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0' }
-    });
-    const $ = cheerio.load(resp.data);
-    const name = $('h1').first().text().trim();
-    return name || 'Не удалось найти имя магазина';
-  } catch (e) {
-    return 'Ошибка при получении информации о магазине';
-  }
-}
+const bot = new Telegraf(process.env.BOT_TOKEN);
+const registrationStep = {};
 
-// --- Заглушка для статуса магазина (можно заменить на реальные данные из API) ---
-async function getShopStatus() {
-  return "Текущий статус магазина:\n\n✅ Все работает штатно\n🕒 Часы работы: 9:00 - 21:00\n📞 Контакты: +7 (XXX) XXX-XX-XX";
-}
-
-// --- Старт/регистрация ---
+// --- Регистрация ---
 bot.start(async ctx => {
-  const chat_id = ctx.from.id;
-  const res = await db.query('SELECT * FROM users WHERE chat_id = $1', [chat_id]);
-  if (res.rowCount > 0) {
-    await ctx.reply('Вы уже зарегистрированы!', getMainMenu());
-  } else {
-    usersAwaiting[chat_id] = { step: 'client_id' };
-    await ctx.reply('Для регистрации введите ваш client_id (это же seller_id):');
-  }
+  registrationStep[ctx.from.id] = {};
+  await ctx.reply('Для регистрации введите ваш client_id и api_key через пробел:');
 });
 
-// --- Универсальный обработчик текстовых сообщений ---
+// --- Приём client_id и seller_api ---
+bot.hears(/^(\d+) (.+)$/i, async ctx => {
+  const chat_id = ctx.from.id;
+  registrationStep[chat_id] = {
+    client_id: ctx.match[1],
+    seller_api: ctx.match[2],
+    first_name: ctx.from.first_name || '',
+    last_name: ctx.from.last_name || ''
+  };
+  await ctx.reply('Введите название вашего магазина (как отображается на Ozon):');
+});
+
+// --- Отправка отчёта за сегодня ---
+bot.hears('🔄 Прислать статус сейчас', async ctx => {
+  const chat_id = ctx.from.id;
+  const user = (await db.query('SELECT * FROM users WHERE chat_id=$1', [chat_id])).rows[0];
+  if (!user) return ctx.reply('Сначала зарегистрируйтесь через /start');
+
+  const today = new Date().toISOString().slice(0, 10);
+  const report = await getTodayReport({ 
+    client_id: user.client_id, 
+    api_key: user.seller_api, 
+    date: today, 
+    shop_name: user.shop_name 
+  });
+  ctx.reply(report, { parse_mode: 'Markdown', reply_markup: getMainMenu().reply_markup });
+});
+
+// --- Подписка/отписка ---
+bot.hears('📩 Подписаться на рассылку', async ctx => {
+  const chat_id = ctx.from.id;
+  await db.query('UPDATE users SET is_subscribed=true WHERE chat_id=$1', [chat_id]);
+  ctx.reply('Вы подписались на рассылку!', getMainMenu());
+});
+bot.hears('🔕 Отписаться от рассылки', async ctx => {
+  const chat_id = ctx.from.id;
+  await db.query('UPDATE users SET is_subscribed=false WHERE chat_id=$1', [chat_id]);
+  ctx.reply('Вы отписались от рассылки.', getMainMenu());
+});
+bot.hears('❓ Помощь', ctx => {
+  ctx.reply('Для помощи обратитесь к администратору.', getMainMenu());
+});
+
+// --- Приём shop_name (только при регистрации) ---
 bot.on('text', async ctx => {
   const chat_id = ctx.from.id;
 
-  // === Регистрация ===
-  if (usersAwaiting[chat_id]) {
-    const state = usersAwaiting[chat_id];
-    if (state.step === 'client_id') {
-      state.client_id = ctx.message.text.trim();
-      state.step = 'seller_api';
-      await ctx.reply('Теперь введите ваш seller_api:');
-    } else if (state.step === 'seller_api') {
-      state.seller_api = ctx.message.text.trim();
-      await db.query(`
-        INSERT INTO users (chat_id, client_id, seller_api, is_subscribed, first_name, last_name)
-        VALUES ($1, $2, $3, true, $4, $5)
-        ON CONFLICT (chat_id)
-        DO UPDATE SET client_id = $2, seller_api = $3, is_subscribed = true, updated_at = NOW()
-      `, [
-        chat_id,
-        state.client_id,
-        state.seller_api,
-        ctx.from.first_name || '',
-        ctx.from.last_name || ''
-      ]);
-      // Новый блок: получаем название магазина
-      const sellerName = await getSellerName(state.client_id);
-      await ctx.reply(`✅ Регистрация завершена!\nВаш магазин: "${sellerName}"`, getMainMenu());
-      delete usersAwaiting[chat_id];
-      return;
-    }
+  if (
+    registrationStep[chat_id] &&
+    registrationStep[chat_id].client_id &&
+    !ctx.message.text.startsWith('/')
+    && !['🔄 Прислать статус сейчас', '❓ Помощь', '📩 Подписаться на рассылку', '🔕 Отписаться от рассылки'].includes(ctx.message.text)
+  ) {
+    const {client_id, seller_api, first_name, last_name} = registrationStep[chat_id];
+    const shop_name = ctx.message.text.trim();
+
+    await db.query(
+      `INSERT INTO users (chat_id, client_id, seller_api, is_subscribed, first_name, last_name, shop_name)
+      VALUES ($1, $2, $3, true, $4, $5, $6)
+      ON CONFLICT (chat_id) DO UPDATE SET client_id = $2, seller_api = $3, first_name = $4, last_name = $5, shop_name = $6`,
+      [chat_id, client_id, seller_api, first_name, last_name, shop_name]
+    );
+    delete registrationStep[chat_id];
+    await ctx.reply(
+      `Вы успешно зарегистрированы и подписаны на рассылку!\nВаш магазин: *${shop_name}*`,
+      { parse_mode: 'Markdown', reply_markup: getMainMenu().reply_markup }
+    );
     return;
   }
-
-  // === Обработка кнопок ===
-  if (ctx.message.text === '🔄 Прислать статус сейчас') {
-    await ctx.reply(await getShopStatus(), getMainMenu());
-  }
-
-  if (ctx.message.text === '❓ Помощь') {
-    await ctx.reply('Справка:\n\n- Зарегистрируйтесь (client_id + seller_api)\n- "Прислать статус сейчас" — мгновенный отчёт\n- "Подписаться/отписаться от рассылки" — управляет ежедневными уведомлениями', getMainMenu());
-  }
-
-  if (ctx.message.text === '📩 Подписаться на рассылку') {
-    await db.query('UPDATE users SET is_subscribed = true WHERE chat_id = $1', [chat_id]);
-    await ctx.reply('Вы подписались на рассылку.', getMainMenu());
-  }
-
-  if (ctx.message.text === '🔕 Отписаться от рассылки') {
-    await db.query('UPDATE users SET is_subscribed = false WHERE chat_id = $1', [chat_id]);
-    await ctx.reply('Вы отписались от рассылки.', getMainMenu());
-  }
 });
 
-// --- Ежедневная рассылка только подписанным ---
+// --- Рассылка отчёта за вчера ---
 cron.schedule('0 10 * * *', async () => {
-  const { rows } = await db.query('SELECT chat_id FROM users WHERE is_subscribed = true');
-  const status = await getShopStatus();
-  for (let user of rows) {
+  const users = (await db.query('SELECT * FROM users WHERE is_subscribed = true')).rows;
+  const date = getYesterdayISO();
+
+  for (let user of users) {
     try {
-      await bot.telegram.sendMessage(user.chat_id, `Ежедневный отчет:\n\n${status}`);
+      const report = await getYesterdayReport({ 
+        client_id: user.client_id, 
+        api_key: user.seller_api, 
+        date, 
+        shop_name: user.shop_name 
+      });
+      await bot.telegram.sendMessage(user.chat_id, report, { parse_mode: 'Markdown' });
     } catch (e) {
-      console.log('Ошибка отправки:', user.chat_id, e.message);
+      console.log(`Ошибка отправки для ${user.chat_id}:`, e.message);
     }
   }
 });
 
-// --- Запуск ---
-db.connect().then(() => bot.launch());
+bot.launch().then(() => console.log("Бот успешно запущен!"));
+db.connect();
