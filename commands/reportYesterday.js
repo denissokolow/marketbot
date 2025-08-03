@@ -1,20 +1,13 @@
-const { getOzonReport } = require('../services/ozonService');
-const { getYesterdayISO } = require('../utils/date');
-
-const cron = require('node-cron');
+const { getOzonReport } = require('../ozon');
+const { getYesterdayISO } = require('../utils');
 
 module.exports = (bot, db) => {
-  // Рассылка отчёта за вчера всем подписчикам
-  cron.schedule('0 10 * * *', async () => {
-    const users = (await db.query('SELECT * FROM users WHERE is_subscribed = true')).rows;
-    const date = getYesterdayISO();
-    for (let user of users) {
-      try {
-        const report = await getOzonReport(user.client_id, user.seller_api, date, 'yesterday', user.shop_name);
-        await bot.telegram.sendMessage(user.chat_id, report, { parse_mode: 'Markdown' });
-      } catch (e) {
-        console.log(`Ошибка отправки для ${user.chat_id}:`, e.message);
-      }
-    }
+  bot.hears('📅 Прислать за вчера', async ctx => {
+    const chat_id = ctx.from.id;
+    const user = (await db.query('SELECT * FROM users WHERE chat_id=$1', [chat_id])).rows[0];
+
+    if (!user) return ctx.reply('Сначала зарегистрируйтесь через /start');
+    const report = await getOzonReport(user.client_id, user.seller_api, getYesterdayISO(), 'yesterday', user.shop_name);
+    ctx.reply(report, { parse_mode: 'Markdown' });
   });
 };
