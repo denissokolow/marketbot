@@ -1,5 +1,5 @@
 const { getYesterdayISO } = require('../utils');
-const { makeYesterdayReportText } = require('../utils/reportText');
+const { makeYesterdayReportText } = require('../reportText');
 
 module.exports = (bot, db) => {
   bot.hears('📅 Прислать за вчера', async ctx => {
