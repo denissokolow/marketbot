@@ -81,43 +81,50 @@ async function getReturnsSum({ client_id, api_key, date }) {
   );
 }
 
-async function getDeliveryBuyoutCount({ client_id, api_key, date }) {
-  const data = await ozonApiRequest({
-    client_id,
-    api_key,
-    endpoint: '/v3/finance/transaction/list',
-    body: {
-      filter: {
-        date_from: `${date}T00:00:00.000Z`,
-        date_to: `${date}T23:59:59.999Z`
-        // note: фильтр по operation_type, если известен, можно добавить
-      },
-  page: 1,
-  page_size: 100
-    }
-  });
+// В utils/ozon.js (или непосредственно в ozon.js)
+async function getDeliveryBuyoutStats({ client_id, api_key, date_from, date_to }) {
+  let totalCount = 0, totalAmount = 0;
+  let page = 1, page_size = 1000;
 
-  if (!data.result?.operations) return 0;
+  while (true) {
+    const data = await ozonApiRequest({
+      client_id,
+      api_key,
+      endpoint: '/v3/finance/transaction/list',
+      body: {
+        filter: {
+          date: { from: date_from, to: date_to },
+          operation_type: [],
+          posting_number: "",
+          transaction_type: "all"
+        },
+        page,
+        page_size
+      }
+    });
 
-  // Фильтруем операции по типу, соответствующему "Доставка покупателю"
-  const deliveryOps = data.result.operations.filter(op =>
-    op.operation_type_name === 'Доставка покупателю' 
-    || op.operation_type === 'orders' // если совпадает
-  );
+    const ops = data.result?.operations || [];
+    ops.forEach(op => {
+      if (op.operation_type_name === "Доставка покупателю") {
+        totalCount++;
+        totalAmount += Number(op.amount);
+      }
+    });
 
-  // Суммируем количество товаров во всех таких операциях
-  return deliveryOps.reduce((total, op) => {
-    const qty = Array.isArray(op.items)
-      ? op.items.reduce((s, item) => s + (item.quantity || 1), 0)
-      : 0;
-    return total + qty;
-  }, 0);
+    if (ops.length < page_size) break;
+    page++;
+  }
+
+  return { count: totalCount, amount: totalAmount };
 }
+
+module.exports = { /* ...твои существующие функции..., */ getDeliveryBuyoutStats };
+
 
 module.exports = {
   getOzonReport,
   getReturnsCount,
   getReturnsSum,
   formatMoney,
-  getDeliveryBuyoutCount
+  getDeliveryBuyoutStats
 };

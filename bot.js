@@ -7,8 +7,6 @@ const { mainMenu } = require('./menu/menu.js');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-
-
 // Подключаем все команды
 fs.readdirSync(path.join(__dirname, 'commands')).forEach(file => {
   if (file.endsWith('.js') && file !== 'register.js') {

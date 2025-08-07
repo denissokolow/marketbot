@@ -1,18 +1,31 @@
-const { getDeliveryBuyoutCount } = require('../ozon');
+const { getDeliveryBuyoutStats } = require('../ozon');
+const { getYesterdayISO } = require('../utils/utils');
 
 module.exports = (bot, db) => {
   bot.command('report_delivery', async ctx => {
-    const chat_id = ctx.from.id;
-    const user = (await db.query('SELECT * FROM users WHERE chat_id=$1', [chat_id])).rows[0];
+    const res = await db.query('SELECT * FROM users WHERE chat_id=$1', [ctx.from.id]);
+    const user = res?.rows?.[0];
     if (!user) return ctx.reply('Сначала зарегистрируйтесь через /start');
 
-    const today = new Date().toISOString().slice(0, 10);
-    const count = await getDeliveryBuyoutCount({
-      client_id: user.client_id,
-      api_key: user.seller_api,
-      date: today
-    });
+    const date = getYesterdayISO(); // вида YYYY-MM-DD
+    const from = `${date}T00:00:00.000Z`;
+    const to   = `${date}T23:59:59.999Z`;
 
-    ctx.reply(`📦 Выкуплено (доставка покупателю): *${count}*`, { parse_mode: 'Markdown' });
+    try {
+      const { count, amount } = await getDeliveryBuyoutStats({
+        client_id: user.client_id,
+        api_key: user.seller_api,
+        date_from: from,
+        date_to: to
+      });
+
+      await ctx.reply(
+        `📦 Выкуп: *${count}*\n💰 Сумма: *${amount.toFixed(2)}₽*`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      console.error(err);
+      await ctx.reply('Ошибка при получении статистики.');
+    }
   });
 };
