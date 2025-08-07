@@ -5,6 +5,7 @@ module.exports = (bot, db) => {
     const res = await db.query('SELECT * FROM users WHERE chat_id=$1', [ctx.from.id]);
     const user = res?.rows?.[0];
     if (!user) return ctx.reply('Сначала зарегистрируйтесь через /start');
-    await ctx.replyWithMarkdown(await makeTodayReportText(user));
+    const text = await makeTodayReportText(user); // Получили текст за сегодня
+    await ctx.reply(text);
   });
 };
