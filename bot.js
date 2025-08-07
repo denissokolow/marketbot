@@ -3,36 +3,28 @@ const { Telegraf } = require('telegraf');
 const db = require('./db');
 const fs = require('fs');
 const path = require('path');
-const cron = require('node-cron');
-const { getMainMenu } = require('./menu/menu.js');
-const { makeYesterdayReportText } = require('./reportText');
-const { getYesterdayISO } = require('./utils');
+const { mainMenu } = require('./menu/menu.js');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// Сначала подключаем все команды (кроме register.js, где есть bot.on('text'))
+
+
+// Подключаем все команды
 fs.readdirSync(path.join(__dirname, 'commands')).forEach(file => {
   if (file.endsWith('.js') && file !== 'register.js') {
     require(`./commands/${file}`)(bot, db);
   }
 });
-// В конце только register.js
+// Только в самом конце!
 require('./commands/register.js')(bot, db);
 
-// --- Рассылка отчета за вчера (cron) ---
-cron.schedule('0 6 * * *', async () => {
-  const users = (await db.query('SELECT * FROM users WHERE is_subscribed = true')).rows;
-  const date = getYesterdayISO();
-  for (let user of users) {
-    try {
-      const report = await makeYesterdayReportText(user, date);
-      await bot.telegram.sendMessage(user.chat_id, report, { parse_mode: 'Markdown' });
-    } catch (e) {
-      console.error(e.message);
-    }
-  }
+// /start команда с приветствием и меню
+bot.start(async ctx => {
+  await ctx.reply('Добро пожаловать! Используйте меню команд Telegram.', mainMenu());
 });
 
-bot.launch().then(() => console.log("Бот успешно запущен!"));
+// Запуск бота
+bot.launch().then(() => console.log('Бот успешно запущен!'));
 db.connect();
+
 
