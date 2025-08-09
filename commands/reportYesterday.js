@@ -1,3 +1,4 @@
+// commands/reportYesterday.js
 const { makeYesterdayReportText } = require('../utils/reportText.js');
 
 module.exports = (bot, db) => {
@@ -5,7 +6,11 @@ module.exports = (bot, db) => {
     const res = await db.query('SELECT * FROM users WHERE chat_id=$1', [ctx.from.id]);
     const user = res?.rows?.[0];
     if (!user) return ctx.reply('Сначала зарегистрируйтесь через /start');
-    const text = await makeYesterdayReportText(user); // Получили текст за вчера
-    await ctx.reply(text);
+
+    const text = await makeYesterdayReportText(user);
+    await ctx.reply(text, { parse_mode: 'HTML' });
   });
 };
+
+
+

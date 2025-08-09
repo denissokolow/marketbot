@@ -1,86 +1,93 @@
-const { 
-  getOzonReport, 
-  getReturnsCount, 
-  getReturnsSum, 
-  getDeliveryBuyoutStats, 
-  getBuyoutAndProfit, 
-  formatMoney 
+// utils/reportText.js
+const {
+  getOzonReport,
+  getReturnsCount,
+  getReturnsSum,
+  getDeliveryBuyoutStats,
+  getBuyoutAndProfit,
+  formatMoney,
 } = require('../ozon');
 const { getTodayISO, getYesterdayISO } = require('./utils');
 
+// HTML-экранирование
+function esc(s = '') {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+// Выравнивание по правому краю
+function padRight(str, width = 8) {
+  const v = String(str);
+  const spaces = Math.max(0, width - v.length);
+  return ' '.repeat(spaces) + v;
+}
+
 async function makeReportText(user, date) {
-  // Даты для запроса
   const from = `${date}T00:00:00.000Z`;
   const to   = `${date}T23:59:59.999Z`;
 
-  // 1. Метрики по заказам
+  // 1) Заказы
   const metrics = await getOzonReport({
     client_id: user.client_id,
     api_key: user.seller_api,
     date,
-    metrics: ['revenue', 'ordered_units']
+    metrics: ['revenue', 'ordered_units'],
   });
 
-  // 2. Возвраты
+  // 2) Возвраты
   const returnsCount = await getReturnsCount({ client_id: user.client_id, api_key: user.seller_api, date });
   const returnsSum = await getReturnsSum({ client_id: user.client_id, api_key: user.seller_api, date });
 
-  // 3. Выкупы (Доставка покупателю, количество, сумма, себестоимость)
+  // 3) Выкупы
   const stats = await getDeliveryBuyoutStats({
     client_id: user.client_id,
     api_key: user.seller_api,
     date_from: from,
-    date_to: to
+    date_to: to,
   });
 
-  // 4. Итоговые суммы по выкупам и прибыли (по /v3/finance/transaction/totals)
+  // 4) Выкуплено на сумму + прибыль
   const { buyoutAmount, profit } = await getBuyoutAndProfit({
     client_id: user.client_id,
     api_key: user.seller_api,
     date_from: from,
     date_to: to,
-    buyoutCost: stats.buyoutCost // Себестоимость обязательно!
+    buyoutCost: stats.buyoutCost,
   });
 
-  // Функция для выравнивания
-const pad = (str, len = 5) => {
-  str = String(str);
-  return ' '.repeat(Math.max(0, len - str.length)) + str;
-};
+  // Собираем в массив строк
+  const lines = [];
+  lines.push(`🏪 Магазин:  ${padRight(user.shop_name || 'Неизвестно', 0)}`);
+  lines.push(`📆 Отчёт за:  ${padRight(date, 0)}`);
+  lines.push('');
+  lines.push(`📦 Заказано товаров:  ${padRight(metrics?.[1] ?? '-', 2)}`);
+  lines.push(`💸 Заказано на сумму:  ${padRight(`${formatMoney(metrics?.[0])}₽`, 2)}`);
+  lines.push('');
+  lines.push(`📦 Выкуплено товаров:  ${padRight(stats.totalCount, 2)}`);
+  lines.push(`💸 Выкуплено на сумму:  ${padRight(`${formatMoney(buyoutAmount)}₽`, 2)}`);
+  lines.push(`💸 Себестоимость выкупов:  ${padRight(`${formatMoney(stats.buyoutCost)}₽`, 2)}`);
+  lines.push(`💰 Прибыль:  ${padRight(`${formatMoney(profit)}₽`, 2)}`);
+  lines.push('');
+  lines.push(`📦 Возвраты:  ${padRight(returnsCount, 2)}`);
+  lines.push(`💸 Возвраты на сумму:  ${padRight(`${formatMoney(returnsSum)}₽`, 2)}`);
 
-  // Формируем отчет БЕЗ блока кода (голубой фон убирается)
-  let result = '';
-  result += `🏪 Магазин:${pad(user.shop_name || "Неизвестно")}\n`;
-  result += `📆 Отчет за:${pad(date)}\n\n`;
-
-  result += `📦 Заказано товаров:${pad(metrics?.[1] ?? '-',50)}\n`;
-  result += `💸 Заказано на сумму:${pad(formatMoney(metrics?.[0]) + '₽',50)}\n\n`;
-
-  result += `📦 Выкуплено товаров:${pad(stats.totalCount,50)}\n`;
-  result += `💸 Выкуплено на сумму:${pad(formatMoney(buyoutAmount) + '₽',50)}\n`;
-  result += `💸 Себестоимость выкупов:${pad(formatMoney(stats.buyoutCost) + '₽', 50)}\n`;
-  result += `🟩 Прибыль:${pad(formatMoney(profit) + '₽', 50)}\n\n`;
-
-  result += `📦 Возвраты:${pad(returnsCount, 50)}\n`;
-  result += `💸 Возвраты на сумму:${pad(formatMoney(returnsSum) + '₽', 50)}\n\n`;
-
-  return result;
+  // Возвращаем всё как <pre>...</pre>
+  return `<pre>${esc(lines.join('\n'))}</pre>`;
 }
 
 async function makeTodayReportText(user) {
   const date = getTodayISO();
-  return await makeReportText(user, date);
+  return makeReportText(user, date);
 }
 
 async function makeYesterdayReportText(user) {
   const date = getYesterdayISO();
-  return await makeReportText(user, date);
+  return makeReportText(user, date);
 }
 
 module.exports = {
   makeTodayReportText,
-  makeYesterdayReportText
+  makeYesterdayReportText,
 };
-
-
-
