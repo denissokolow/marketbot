@@ -24,6 +24,15 @@ function padRight(str, width = 8) {
   return ' '.repeat(spaces) + v;
 }
 
+// Формат с 2 знаками после запятой
+function format2(num) {
+  if (num == null || !isFinite(num)) return '-';
+  return Number(num).toLocaleString('ru-RU', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
 async function makeReportText(user, date) {
   const from = `${date}T00:00:00.000Z`;
   const to   = `${date}T23:59:59.999Z`;
@@ -49,21 +58,28 @@ async function makeReportText(user, date) {
   });
 
   // 4) Выкуплено на сумму + прибыль
-  const { buyoutAmount, profit } = await getBuyoutAndProfit({
+  const { buyoutAmount, profit, services_amount } = await getBuyoutAndProfit({
     client_id: user.client_id,
     api_key: user.seller_api,
     date_from: from,
     date_to: to,
     buyoutCost: stats.buyoutCost,
+    buyoutAmount: stats.totalAmount // ← из getDeliveryBuyoutStats
   });
+
+  // 5) ДРР = (расходы на рекламу / заказано на сумму) * 100
+  const revenueOrdered = Number(metrics?.[0] || 0);
+  const adSpend = Math.abs(Number(services_amount || 0));
+  const drrPercent = revenueOrdered > 0 ? (adSpend / revenueOrdered) * 100 : null;
 
   // Собираем в массив строк
   const lines = [];
   lines.push(`🏪 Магазин:  ${padRight(user.shop_name || 'Неизвестно', 0)}`);
+  lines.push('');
   lines.push(`📆 Отчёт за:  ${padRight(date, 0)}`);
   lines.push('');
   lines.push(`📦 Заказано товаров:  ${padRight(metrics?.[1] ?? '-', 2)}`);
-  lines.push(`💸 Заказано на сумму:  ${padRight(`${formatMoney(metrics?.[0])}₽`, 2)}`);
+  lines.push(`💸 Заказано на сумму:  ${padRight(`${formatMoney(revenueOrdered)}₽`, 2)}`);
   lines.push('');
   lines.push(`📦 Выкуплено товаров:  ${padRight(stats.totalCount, 2)}`);
   lines.push(`💸 Выкуплено на сумму:  ${padRight(`${formatMoney(buyoutAmount)}₽`, 2)}`);
@@ -72,6 +88,9 @@ async function makeReportText(user, date) {
   lines.push('');
   lines.push(`📦 Возвраты:  ${padRight(returnsCount, 2)}`);
   lines.push(`💸 Возвраты на сумму:  ${padRight(`${formatMoney(returnsSum)}₽`, 2)}`);
+  lines.push('');
+  lines.push(`💸 Расходы на рекламу:  ${padRight(`${formatMoney(adSpend)}₽`, 2)}`);
+  lines.push(`💸 Д.Р.Р:  ${padRight(drrPercent == null ? '-' : `${format2(drrPercent)}%`, 2)}`);
 
   // Возвращаем всё как <pre>...</pre>
   return `<pre>${esc(lines.join('\n'))}</pre>`;

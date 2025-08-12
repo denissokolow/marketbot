@@ -83,12 +83,18 @@ async function getReturnsSum({ client_id, api_key, date }) {
 
 // В ozon.js 
 async function getDeliveryBuyoutStats({ client_id, api_key, date_from, date_to }) {
-  let totalCount = 0, totalAmount = 0, buyoutCost = 0;
-  let page = 1, page_size = 1000;
+  let totalCount = 0;
+  let totalAmount = 0; // из accruals_for_sale > 0
+  let buyoutCost = 0;
+
   const COSTS = {
     2260596905: 300,
-    2262027895: 500
+    2262027895: 500,
+    2583172589: 1300
   };
+
+  let page = 1;
+  const page_size = 1000;
 
   while (true) {
     const data = await ozonApiRequest({
@@ -99,40 +105,59 @@ async function getDeliveryBuyoutStats({ client_id, api_key, date_from, date_to }
         filter: {
           date: { from: date_from, to: date_to },
           operation_type: [],
-          posting_number: "",
-          transaction_type: "all"
+          posting_number: '',
+          transaction_type: 'all',
         },
         page,
-        page_size
-      }
+        page_size,
+      },
     });
 
-    const ops = data.result?.operations || [];
-    ops.forEach(op => {
-      if (op.operation_type_name === "Доставка покупателю") {
-        totalCount++;
-        totalAmount += Number(op.amount);
+    const ops = data?.result?.operations || [];
+    if (!ops.length) break;
 
-        // Вычисляем себестоимость по каждой item внутри операции
-        if (op.items && Array.isArray(op.items)) {
-          op.items.forEach(item => {
-            if (COSTS[item.sku]) {
-              buyoutCost += COSTS[item.sku];
+    for (const op of ops) {
+      if (op?.type === 'orders' && op?.operation_type_name === 'Доставка покупателю') {
+        const acc = Number(op?.accruals_for_sale ?? 0);
+
+        // временный вывод для отладки
+        console.log(`Операция ${op.operation_id || '(без id)'}: accruals_for_sale=${acc}`);
+
+        if (acc > 0) {
+          totalCount += 1;
+          totalAmount += acc;
+          console.log(`✅ Засчитано в "выкуплено на сумму": +${acc}`);
+        } else {
+          console.log(`⏩ Пропущено (не положительное значение)`);
+        }
+
+        if (Array.isArray(op?.items)) {
+          for (const item of op.items) {
+            const cost = COSTS[item?.sku];
+            if (cost) {
+              buyoutCost += cost;
+              console.log(`💰 Себестоимость +${cost} по SKU ${item?.sku}`);
             }
-          });
+          }
         }
       }
-    });
+    }
 
     if (ops.length < page_size) break;
-    page++;
+    page += 1;
   }
+
+  console.log(`--- Итог по getDeliveryBuyoutStats ---`);
+  console.log(`Выкуплено товаров: ${totalCount}`);
+  console.log(`Выкуплено на сумму: ${totalAmount}`);
+  console.log(`Себестоимость: ${buyoutCost}`);
 
   return { totalCount, totalAmount, buyoutCost };
 }
 
+
 // Получение buyoutAmount и profit по /v3/finance/transaction/totals
-async function getBuyoutAndProfit({ client_id, api_key, date_from, date_to, buyoutCost }) {
+async function getBuyoutAndProfit({ client_id, api_key, date_from, date_to, buyoutCost, buyoutAmount }) {
   const data = await ozonApiRequest({
     client_id,
     api_key,
@@ -144,19 +169,18 @@ async function getBuyoutAndProfit({ client_id, api_key, date_from, date_to, buyo
     }
   });
 
-  const totals = data.result || {};
+  const t = data.result || {};
+  const sale_commission            = Number(t.sale_commission || 0);
+  const processing_and_delivery    = Number(t.processing_and_delivery || 0);
+  const refunds_and_cancellations  = Number(t.refunds_and_cancellations || 0);
+  const services_amount            = Number(t.services_amount || 0);
+  const compensation_amount        = Number(t.compensation_amount || 0);
+  const money_transfer             = Number(t.money_transfer || 0);
+  const others_amount              = Number(t.others_amount || 0);
 
-  const accruals_for_sale = Number(totals.accruals_for_sale || 0);
-  const sale_commission = Number(totals.sale_commission || 0);
-  const processing_and_delivery = Number(totals.processing_and_delivery || 0);
-  const refunds_and_cancellations = Number(totals.refunds_and_cancellations || 0);
-  const services_amount = Number(totals.services_amount || 0);
-  const compensation_amount = Number(totals.compensation_amount || 0);
-  const money_transfer = Number(totals.money_transfer || 0);
-  const others_amount = Number(totals.others_amount || 0);
-
-  // Подсчет прибыли по формуле:
-  const profit = accruals_for_sale
+  // ВАЖНО: прибыль считаем из buyoutAmount (stats.totalAmount), а не из totals.accruals_for_sale
+  const profit =
+      (Number(buyoutAmount) || 0)
     + sale_commission
     + processing_and_delivery
     + refunds_and_cancellations
@@ -164,11 +188,11 @@ async function getBuyoutAndProfit({ client_id, api_key, date_from, date_to, buyo
     + compensation_amount
     + money_transfer
     + others_amount
-    - (buyoutCost || 0);
+    - (Number(buyoutCost) || 0);
 
-  // === ВРЕМЕННО! Блок для вывода всех значений: ===
-  console.log('--- Финансовые данные для расчета прибыли ---');
-  console.log('accruals_for_sale:', accruals_for_sale);
+  // Логи для контроля
+  console.log('--- Финансовые данные для расчёта прибыли ---');
+  console.log('buyoutAmount (из /list):', buyoutAmount);
   console.log('sale_commission:', sale_commission);
   console.log('processing_and_delivery:', processing_and_delivery);
   console.log('refunds_and_cancellations:', refunds_and_cancellations);
@@ -179,10 +203,7 @@ async function getBuyoutAndProfit({ client_id, api_key, date_from, date_to, buyo
   console.log('buyoutCost (себестоимость):', buyoutCost);
   console.log('Итого прибыль:', profit);
 
-  return {
-    buyoutAmount: accruals_for_sale,
-    profit
-  };
+  return { buyoutAmount, profit, services_amount };
 }
 
 module.exports = {
