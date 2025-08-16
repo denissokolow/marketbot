@@ -11,8 +11,11 @@ module.exports = (bot, db) => {
     const trackedSkus = await getTrackedSkusForUser(db, ctx.from.id);
     console.log('[report_yesterday] trackedSkus ->', trackedSkus);
 
-    const text = await makeYesterdayReportText(user, { trackedSkus });
+    const text = await makeYesterdayReportText(user, {
+      trackedSkus,
+      db,               // прокидываем для себестоимости net
+      chatId: ctx.from.id,
+    });
     await ctx.reply(text, { parse_mode: 'HTML' });
   });
 };
-

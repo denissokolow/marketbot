@@ -33,6 +33,26 @@ function normalizeSkuFilter(trackedSkus) {
   return cleaned.length ? cleaned : null;
 }
 
+/** Загрузить карту себестоимости из БД: Map<sku(number) -> net(number≥0)> */
+async function loadCostsMap(db, chatId) {
+  if (!db || !chatId) return new Map(); // опционально
+  const sql = `
+    SELECT tp.sku::bigint AS sku, COALESCE(tp.net, 0)::bigint AS net
+    FROM tracked_products tp
+    JOIN shops s ON s.id = tp.shop_id
+    WHERE s.chat_id = $1
+      AND tp.is_active = TRUE
+  `;
+  const r = await db.query(sql, [chatId]);
+  const map = new Map();
+  for (const row of r.rows || []) {
+    const sku = Number(row.sku);
+    const net = Math.max(0, Number(row.net) || 0);
+    if (Number.isFinite(sku)) map.set(sku, net);
+  }
+  return map;
+}
+
 /**
  * Позитивные остатки, агрегированные по SKU (для первичного наполнения ассортимента)
  * /v1/analytics/manage/stocks
@@ -73,9 +93,9 @@ async function fetchStocksPositiveBySku({ client_id, api_key }) {
 
 /**
  * /v1/analytics/data — С УЧЁТОМ ФИЛЬТРА SKU
- * ВАЖНО: API не принимает массив значений для sku (даёт 400).
- * Поэтому суммируем метрики по каждому SKU отдельным запросом.
- * Возвращает массив метрик в формате как у вас было раньше: [revenue, ordered_units]
+ * Оzon API не принимает массив значений для sku (даёт 400),
+ * поэтому суммируем метрики по каждому SKU отдельным запросом.
+ * Возвращает массив метрик: [revenue, ordered_units]
  */
 async function getOzonReportFiltered({ client_id, api_key, date, metrics, trackedSkus }) {
   const list = normalizeSkuFilter(trackedSkus);
@@ -127,7 +147,6 @@ async function getOzonReportFiltered({ client_id, api_key, date, metrics, tracke
         ordered += Number(m[1] || 0);
       }
     } catch (e) {
-      // Логируем и идём дальше по следующему SKU
       console.error('[getOzonReportFiltered] error per SKU', sku, e?.response?.data || e.message);
     }
   }
@@ -230,14 +249,26 @@ async function getReturnsSumFiltered({ client_id, api_key, date, trackedSkus }) 
 /**
  * Доставка покупателю (из /v3/finance/transaction/list) с фильтром по отслеживаемым SKU.
  * totalAmount — сумма ПОЛОЖИТЕЛЬНЫХ accruals_for_sale по включённым операциям.
+ * buyoutCost — сумма net по позициям операции (берётся из tracked_products.net; NULL/0 → 0).
+ *
+ * Доп. параметры (необязательно):
+ *  - db, chatId — чтобы подтянуть net из БД. Если не передать, себестоимость = 0.
  */
-async function getDeliveryBuyoutStats({ client_id, api_key, date_from, date_to, trackedSkus = null }) {
+async function getDeliveryBuyoutStats({
+  client_id,
+  api_key,
+  date_from,
+  date_to,
+  trackedSkus = null,
+  db = null,
+  chatId = null,
+}) {
   let totalCount = 0;
   let totalAmount = 0;
   let buyoutCost = 0;
 
-  // заглушка себестоимости
-  const COSTS = { 2260596905: 300, 2262027895: 500, 2583172589: 1300 };
+  // карта себестоимости из БД: sku -> net
+  const costsMap = await loadCostsMap(db, chatId); // пустая Map(), если db/chatId не передали
 
   const skuFilterArray = normalizeSkuFilter(trackedSkus);
   const skuFilter = skuFilterArray ? new Set(skuFilterArray) : null;
@@ -282,25 +313,24 @@ async function getDeliveryBuyoutStats({ client_id, api_key, date_from, date_to, 
       const items = Array.isArray(op?.items) ? op.items : [];
       const include = hasTracked(items);
 
-      if (skuFilter) {
-        const list = items.map(i => Number(i?.sku)).filter(Boolean);
-        console.log(`op ${op?.operation_id || '-'} items: [${list.join(', ')}] -> ${include ? 'IN' : 'OUT'}`);
-      }
-
       if (!include) continue;
 
+      // Сумма по операции
       const acc = Number(op?.accruals_for_sale ?? 0);
       if (acc > 0) {
         totalCount += 1;
         totalAmount += acc;
       }
 
+      // Себестоимость — из tracked_products.net (NULL/0 → 0)
       for (const item of items) {
         const skuNum = Number(item?.sku);
         if (!skuNum) continue;
-        if (skuFilter && !skuFilter.has(skuNum)) continue;
-        const cost = COSTS[skuNum];
-        if (cost) buyoutCost += cost;
+        if (skuFilter && !skuFilter.has(skuNum)) continue; // при фильтре учитываем только отслеживаемые
+        const net = Number(costsMap.get(skuNum) || 0);
+        if (Number.isFinite(net) && net > 0) {
+          buyoutCost += net;
+        }
       }
     }
 
@@ -317,7 +347,7 @@ async function getDeliveryBuyoutStats({ client_id, api_key, date_from, date_to, 
 }
 
 /**
- * Итоги (прибыль/реклама). ВНИМАНИЕ: totals в API не умеет фильтроваться по SKU,
+ * Итоги (прибыль/реклама). totals в API не умеет фильтроваться по SKU,
  * поэтому buyoutAmount берём отфильтрованный (из /list), а комиссии/доставка/прочее — как есть.
  */
 async function getBuyoutAndProfit({ client_id, api_key, date_from, date_to, buyoutCost, buyoutAmount }) {
@@ -364,4 +394,3 @@ module.exports = {
   getDeliveryBuyoutStats,
   getBuyoutAndProfit,
 };
-
