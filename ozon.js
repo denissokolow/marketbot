@@ -92,6 +92,32 @@ async function fetchStocksPositiveBySku({ client_id, api_key }) {
 }
 
 /**
+ * Среднее время доставки (дни) за период.
+ * POST /v1/analytics/average-delivery-time/summary
+ * Возвращает number или null при ошибке.
+ */
+async function getAverageDeliveryTime({ client_id, api_key, date_from, date_to }) {
+  try {
+    const data = await ozonApiRequest({
+      client_id,
+      api_key,
+      endpoint: '/v1/analytics/average-delivery-time/summary',
+      body: {
+        date_from: date_from, // формат YYYY-MM-DDTHH:mm:ss.SSSZ
+        date_to:   date_to,
+      },
+    });
+
+    const val = data?.result?.average_delivery_time ?? data?.average_delivery_time;
+    const n = Number(val);
+    return Number.isFinite(n) ? n : null;
+  } catch (e) {
+    console.error('[getAverageDeliveryTime] error:', e?.response?.status, e?.response?.data || e.message);
+    return null;
+  }
+}
+
+/**
  * /v1/analytics/data — С УЧЁТОМ ФИЛЬТРА SKU
  * Оzon API не принимает массив значений для sku (даёт 400),
  * поэтому суммируем метрики по каждому SKU отдельным запросом.
@@ -393,4 +419,5 @@ module.exports = {
   getReturnsSumFiltered,
   getDeliveryBuyoutStats,
   getBuyoutAndProfit,
+  getAverageDeliveryTime
 };

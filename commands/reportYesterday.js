@@ -17,5 +17,7 @@ module.exports = (bot, db) => {
       chatId: ctx.from.id,
     });
     await ctx.reply(text, { parse_mode: 'HTML' });
+
+    await ctx.reply('📊 Дополнительный отчёт сформирован', { parse_mode: 'HTML' });
   });
 };

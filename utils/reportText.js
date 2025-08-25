@@ -5,8 +5,11 @@ const {
   getReturnsSumFiltered,
   getDeliveryBuyoutStats,
   getBuyoutAndProfit,
+  getAverageDeliveryTimeDays, // <- функция, делающая POST /v1/analytics/average-delivery-time/summary и возвращающая число дней
   formatMoney,
 } = require('../ozon');
+
+const { getCampaignDailyStatsTotals } = require('../services/performanceApi');
 const { getTodayISO, getYesterdayISO } = require('./utils');
 
 // HTML-экранирование
@@ -17,14 +20,14 @@ function esc(s = '') {
     .replace(/>/g, '&gt;');
 }
 
-// Выравнивание по правому краю
+// Выравнивание по правому краю (моноширинный)
 function padRight(str, width = 8) {
   const v = String(str);
   const spaces = Math.max(0, width - v.length);
   return ' '.repeat(spaces) + v;
 }
 
-// Формат с 2 знаками после запятой
+// Формат c 2 знаками после запятой (запятая в ru-RU)
 function format2(num) {
   if (num == null || !isFinite(num)) return '-';
   return Number(num).toLocaleString('ru-RU', {
@@ -37,7 +40,7 @@ function format2(num) {
  * Собирает текст отчёта за дату.
  * opts:
  *  - trackedSkus: Set<number> | number[] — фильтр по SKU
- *  - hideAds: boolean — если true, не выводить «Расходы на рекламу» и «Д.Р.Р.»
+ *  - hideAds: boolean — если true, не выводить «Расходы на рекламу / Д.Р.Р. / CTR / СВД»
  *  - db: pg client (для себестоимости из tracked_products.net)
  *  - chatId: number (для выборки себестоимости по пользователю)
  */
@@ -59,11 +62,10 @@ async function makeReportText(user, date, opts = {}) {
     trackedSkus,
   });
 
-  // метрики возвращаются как [revenue, ordered_units]
   const revenueOrdered = Number(metrics?.[0] || 0);
   const orderedUnits   = Number(metrics?.[1] || 0);
 
-  // 2) Возвраты (с фильтром по SKU)
+  // 2) Возвраты (фильтр по SKU)
   const returnsCount = await getReturnsCountFiltered({
     client_id: user.client_id,
     api_key:   user.seller_api,
@@ -77,18 +79,18 @@ async function makeReportText(user, date, opts = {}) {
     trackedSkus,
   });
 
-  // 3) Выкупы (фильтруются по trackedSkus; себестоимость из tracked_products.net через db/chatId)
+  // 3) Выкупы (фильтр по SKU; себестоимость из tracked_products.net через db/chatId)
   const stats = await getDeliveryBuyoutStats({
-    client_id: user.client_id,
-    api_key:   user.seller_api,
-    date_from: from,
-    date_to:   to,
+    client_id:  user.client_id,
+    api_key:    user.seller_api,
+    date_from:  from,
+    date_to:    to,
     trackedSkus,
-    db,       // важно для себестоимости net
-    chatId,   // важно для себестоимости net
+    db,
+    chatId,
   });
 
-  // 4) Выкуплено на сумму + прибыль (buyoutAmount берём из /list)
+  // 4) Суммарные итоги (прибыль считаетcя на базе buyoutAmount из /list)
   const { buyoutAmount, profit, services_amount } = await getBuyoutAndProfit({
     client_id:  user.client_id,
     api_key:    user.seller_api,
@@ -98,11 +100,65 @@ async function makeReportText(user, date, opts = {}) {
     buyoutAmount: stats.totalAmount,
   });
 
-  // 5) ДРР (если не скрываем рекламные строки)
-  const adSpend    = Math.abs(Number(services_amount || 0));
-  const drrPercent = revenueOrdered > 0 ? (adSpend / revenueOrdered) * 100 : null;
+  // --- РЕКЛАМА: Performance API ---
+  let adSpendPerf = null; // ₽
+  let ctrPerf     = null; // %
+  let drrPerf     = null; // %
+  // --- СВД (среднее время доставки, дни) ---
+  let svdDaysInt  = null;
 
-  // Текст отчёта
+  if (!hideAds) {
+    // 4.1 Performance (CTR, расходы, ДРР от perf)
+    try {
+      let perfId = null, perfSecret = null;
+      if (db && chatId) {
+        const rr = await db.query(
+          `SELECT performance_client_id, performance_secret
+             FROM shops
+            WHERE chat_id = $1
+              AND performance_client_id IS NOT NULL
+              AND performance_secret IS NOT NULL
+            ORDER BY id
+            LIMIT 1`,
+          [chatId]
+        );
+        if (rr.rowCount) {
+          perfId = rr.rows[0].performance_client_id;
+          perfSecret = rr.rows[0].performance_secret;
+        }
+      }
+
+      if (perfId && perfSecret) {
+        const { views, clicks, spent } = await getCampaignDailyStatsTotals({
+          client_id: perfId,
+          client_secret: perfSecret,
+          date, // YYYY-MM-DD
+        });
+
+        adSpendPerf = spent; // ₽
+        ctrPerf     = views > 0 ? (clicks / views) * 100 : null;
+        drrPerf     = revenueOrdered > 0 ? (spent / revenueOrdered) * 100 : null;
+      }
+    } catch (e) {
+      console.error('[makeReportText] Performance API error:', e?.response?.data || e.message);
+    }
+
+    // 4.2 СВД (дни, округляем до целого без знаков после запятой)
+    try {
+      const svd = await getAverageDeliveryTimeDays({
+        client_id: user.client_id,
+        api_key:   user.seller_api,
+        date, // отчет за конкретный день
+      });
+      if (svd != null && isFinite(svd)) {
+        svdDaysInt = Math.round(Number(svd));
+      }
+    } catch (e) {
+      console.error('[makeReportText] SVD error:', e?.response?.data || e.message);
+    }
+  }
+
+  // Формируем текст (каждую строку будем печатать в <code>...</code>)
   const lines = [];
   lines.push(`🏪 Магазин:  ${padRight(user.shop_name || 'Неизвестно', 0)}`);
   lines.push('');
@@ -114,30 +170,39 @@ async function makeReportText(user, date, opts = {}) {
   lines.push(`📦 Выкуплено товаров:  ${padRight(stats.totalCount, 2)}`);
   lines.push(`💸 Выкуплено на сумму:  ${padRight(`${formatMoney(buyoutAmount)}₽`, 2)}`);
   lines.push(`💸 Себестоимость выкупов:  ${padRight(`${formatMoney(stats.buyoutCost)}₽`, 2)}`);
-  lines.push(`💰 Прибыль:  ${padRight(`${formatMoney(profit)}₽`, 2)}`);
   lines.push('');
   lines.push(`📦 Возвраты:  ${padRight(returnsCount, 2)}`);
   lines.push(`💸 Возвраты на сумму:  ${padRight(`${formatMoney(returnsSum)}₽`, 2)}`);
   lines.push('');
 
   if (!hideAds) {
-    lines.push(`💸 Расходы на рекламу:  ${padRight(`${formatMoney(adSpend)}₽`, 2)}`);
-    lines.push(`💸 Д.Р.Р:  ${padRight(drrPercent == null ? '-' : `${format2(drrPercent)}%`, 2)}`);
+    const adSpendLine = adSpendPerf == null ? '-' : `${formatMoney(adSpendPerf)}₽`;
+    const drrLine     = drrPerf == null     ? '-' : `${format2(drrPerf)}%`;
+    const ctrLine     = ctrPerf == null     ? '-' : `${format2(ctrPerf)}%`;
+    const svdLine     = svdDaysInt == null  ? '-' : `${svdDaysInt.toLocaleString('ru-RU')} дн.`;
+
+    lines.push(`💸 Расходы на рекламу:  ${padRight(adSpendLine, 2)}`);
+    lines.push(`💸 Д.Р.Р:  ${padRight(drrLine, 2)}`);
+    lines.push(`💸 CTR:  ${padRight(ctrLine, 2)}`);
+    lines.push('');
+    lines.push(`📦 СВД:  ${padRight(svdLine, 2)}`);
+    lines.push('');
+    lines.push(`💰 Прибыль:  ${padRight(`${formatMoney(profit)}₽`, 2)}`);
     lines.push('');
   }
 
-  return `<pre>${esc(lines.join('\n'))}</pre>`;
+  // Возвращаем без <pre>: каждая строка в <code>...</code> (моноширинный, без голубого фона)
+  const html = lines.map(line => `<code>${esc(line)}</code>`).join('\n');
+  return html;
 }
 
 async function makeTodayReportText(user, opts = {}) {
   const date = getTodayISO();
-  // для сегодня скрываем рекламные строки
   return makeReportText(user, date, { ...(opts || {}), hideAds: true });
 }
 
 async function makeYesterdayReportText(user, opts = {}) {
   const date = getYesterdayISO();
-  // для вчера всё показываем
   return makeReportText(user, date, { ...(opts || {}), hideAds: false });
 }
 

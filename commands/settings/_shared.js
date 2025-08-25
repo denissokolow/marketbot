@@ -3,21 +3,31 @@ const { Markup } = require('telegraf');
 const CB = {
   MAIN:        'set_main',
   PROFILE:     'set_prof',
+
   SHOPS:       'set_shops',
   SHOP_OPEN:   'set_shop',     // set_shop:<shopId>
 
+  // Товары (отслеживание)
   PRODS:       'set_prods',    // set_prods:<shopId>:<page>
   TOGGLE:      'set_tgl',      // set_tgl:<shopId>:<sku>:<page>
 
-  ADD_SHOP:    'set_add_shop',
-  DEL_SHOP:    'set_del_shop',
-
-  COSTS:       'set_costs',    // set_costs:<page>
+  // Себестоимость
+  COSTS:       'set_costs',    // set_costs:<shopId>:<page>
   COST_SET:    'set_cost',     // set_cost:<shopId>:<sku>:<page>
+
+  // Магазины: добавить/удалить
+  ADD_SHOP:    'set_add_shop',
+  ADD_CANCEL:  'set_add_cancel',
+  DEL_SHOP:    'set_del_shop',
+  DEL_CONF:    'set_del_conf',   // set_del_conf:<shopId>
+  DEL_DO:      'set_del_do',     // set_del_do:<shopId>
 };
 
 const PAGE_SIZE = 10;
-const costInputState = new Map();
+
+// ожидания ввода
+const costInputState   = new Map(); // { shopId, sku, backData }
+const addShopInputState = new Map(); // { step, shop_name, client_id }
 
 const asInt = (v, d = 0) => {
   const n = Number.parseInt(v, 10);
@@ -45,7 +55,6 @@ function mainKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('👤 Профиль', CB.PROFILE)],
     [Markup.button.callback('🏬 Магазины', CB.SHOPS)],
-    [Markup.button.callback('💵 Себестоимость товаров', `${CB.COSTS}:1`)],
   ]);
 }
 
@@ -62,5 +71,6 @@ module.exports = {
   mainKeyboard,
   backRow,
   costInputState,
+  addShopInputState,
 };
 

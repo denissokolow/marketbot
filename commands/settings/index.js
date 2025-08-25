@@ -23,4 +23,3 @@ module.exports = (bot, db) => {
   // no-op для "стр. X/Y"
   bot.action('noop', async (ctx) => ctx.answerCbQuery());
 };
-
