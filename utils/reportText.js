@@ -5,10 +5,9 @@ const {
   getReturnsSumFiltered,
   getDeliveryBuyoutStats,
   getBuyoutAndProfit,
-  getAverageDeliveryTimeDays, // <- функция, делающая POST /v1/analytics/average-delivery-time/summary и возвращающая число дней
+  getSalesBreakdownBySku,
   formatMoney,
 } = require('../ozon');
-
 const { getCampaignDailyStatsTotals } = require('../services/performanceApi');
 const { getTodayISO, getYesterdayISO } = require('./utils');
 
@@ -20,14 +19,14 @@ function esc(s = '') {
     .replace(/>/g, '&gt;');
 }
 
-// Выравнивание по правому краю (моноширинный)
+// Выравнивание по правому краю (для моноширинного текста)
 function padRight(str, width = 8) {
   const v = String(str);
   const spaces = Math.max(0, width - v.length);
   return ' '.repeat(spaces) + v;
 }
 
-// Формат c 2 знаками после запятой (запятая в ru-RU)
+// Формат с 2 знаками после запятой
 function format2(num) {
   if (num == null || !isFinite(num)) return '-';
   return Number(num).toLocaleString('ru-RU', {
@@ -36,13 +35,14 @@ function format2(num) {
   });
 }
 
+// Первое слово из названия
+function firstWord(s = '') {
+  return String(s).trim().split(/\s+/)[0] || '';
+}
+
 /**
- * Собирает текст отчёта за дату.
- * opts:
- *  - trackedSkus: Set<number> | number[] — фильтр по SKU
- *  - hideAds: boolean — если true, не выводить «Расходы на рекламу / Д.Р.Р. / CTR / СВД»
- *  - db: pg client (для себестоимости из tracked_products.net)
- *  - chatId: number (для выборки себестоимости по пользователю)
+ * Основной отчёт за дату
+ * СТИЛЬ: каждая строка в <code>...</code> (моноширинный без подложки)
  */
 async function makeReportText(user, date, opts = {}) {
   const from = `${date}T00:00:00.000Z`;
@@ -53,7 +53,7 @@ async function makeReportText(user, date, opts = {}) {
   const db          = opts.db || null;
   const chatId      = opts.chatId || null;
 
-  // 1) Заказы (фильтр по SKU)
+  // 1) Заказы
   const metrics = await getOzonReportFiltered({
     client_id: user.client_id,
     api_key:   user.seller_api,
@@ -61,11 +61,10 @@ async function makeReportText(user, date, opts = {}) {
     metrics: ['revenue', 'ordered_units'],
     trackedSkus,
   });
-
   const revenueOrdered = Number(metrics?.[0] || 0);
   const orderedUnits   = Number(metrics?.[1] || 0);
 
-  // 2) Возвраты (фильтр по SKU)
+  // 2) Возвраты
   const returnsCount = await getReturnsCountFiltered({
     client_id: user.client_id,
     api_key:   user.seller_api,
@@ -79,19 +78,19 @@ async function makeReportText(user, date, opts = {}) {
     trackedSkus,
   });
 
-  // 3) Выкупы (фильтр по SKU; себестоимость из tracked_products.net через db/chatId)
+  // 3) Выкупы + себестоимость
   const stats = await getDeliveryBuyoutStats({
-    client_id:  user.client_id,
-    api_key:    user.seller_api,
-    date_from:  from,
-    date_to:    to,
+    client_id: user.client_id,
+    api_key:   user.seller_api,
+    date_from: from,
+    date_to:   to,
     trackedSkus,
     db,
     chatId,
   });
 
-  // 4) Суммарные итоги (прибыль считаетcя на базе buyoutAmount из /list)
-  const { buyoutAmount, profit, services_amount } = await getBuyoutAndProfit({
+  // 4) Прибыль
+  const { buyoutAmount, profit /*, services_amount*/ } = await getBuyoutAndProfit({
     client_id:  user.client_id,
     api_key:    user.seller_api,
     date_from:  from,
@@ -100,15 +99,9 @@ async function makeReportText(user, date, opts = {}) {
     buyoutAmount: stats.totalAmount,
   });
 
-  // --- РЕКЛАМА: Performance API ---
-  let adSpendPerf = null; // ₽
-  let ctrPerf     = null; // %
-  let drrPerf     = null; // %
-  // --- СВД (среднее время доставки, дни) ---
-  let svdDaysInt  = null;
-
+  // --- реклама Performance ---
+  let adSpendPerf = null, ctrPerf = null, drrPerf = null;
   if (!hideAds) {
-    // 4.1 Performance (CTR, расходы, ДРР от perf)
     try {
       let perfId = null, perfSecret = null;
       if (db && chatId) {
@@ -127,38 +120,22 @@ async function makeReportText(user, date, opts = {}) {
           perfSecret = rr.rows[0].performance_secret;
         }
       }
-
-      if (perfId && perfSecret) {
+      if (perfId && perfSecret && typeof getCampaignDailyStatsTotals === 'function') {
         const { views, clicks, spent } = await getCampaignDailyStatsTotals({
           client_id: perfId,
           client_secret: perfSecret,
-          date, // YYYY-MM-DD
+          date,
         });
-
-        adSpendPerf = spent; // ₽
-        ctrPerf     = views > 0 ? (clicks / views) * 100 : null;
-        drrPerf     = revenueOrdered > 0 ? (spent / revenueOrdered) * 100 : null;
+        adSpendPerf = spent;
+        ctrPerf = views > 0 ? (clicks / views) * 100 : null;
+        drrPerf = revenueOrdered > 0 ? (spent / revenueOrdered) * 100 : null;
       }
     } catch (e) {
       console.error('[makeReportText] Performance API error:', e?.response?.data || e.message);
     }
-
-    // 4.2 СВД (дни, округляем до целого без знаков после запятой)
-    try {
-      const svd = await getAverageDeliveryTimeDays({
-        client_id: user.client_id,
-        api_key:   user.seller_api,
-        date, // отчет за конкретный день
-      });
-      if (svd != null && isFinite(svd)) {
-        svdDaysInt = Math.round(Number(svd));
-      }
-    } catch (e) {
-      console.error('[makeReportText] SVD error:', e?.response?.data || e.message);
-    }
   }
 
-  // Формируем текст (каждую строку будем печатать в <code>...</code>)
+  // Формируем строки
   const lines = [];
   lines.push(`🏪 Магазин:  ${padRight(user.shop_name || 'Неизвестно', 0)}`);
   lines.push('');
@@ -179,34 +156,71 @@ async function makeReportText(user, date, opts = {}) {
     const adSpendLine = adSpendPerf == null ? '-' : `${formatMoney(adSpendPerf)}₽`;
     const drrLine     = drrPerf == null     ? '-' : `${format2(drrPerf)}%`;
     const ctrLine     = ctrPerf == null     ? '-' : `${format2(ctrPerf)}%`;
-    const svdLine     = svdDaysInt == null  ? '-' : `${svdDaysInt.toLocaleString('ru-RU')} дн.`;
-
     lines.push(`💸 Расходы на рекламу:  ${padRight(adSpendLine, 2)}`);
     lines.push(`💸 Д.Р.Р:  ${padRight(drrLine, 2)}`);
     lines.push(`💸 CTR:  ${padRight(ctrLine, 2)}`);
-    lines.push('');
-    lines.push(`📦 СВД:  ${padRight(svdLine, 2)}`);
     lines.push('');
     lines.push(`💰 Прибыль:  ${padRight(`${formatMoney(profit)}₽`, 2)}`);
     lines.push('');
   }
 
-  // Возвращаем без <pre>: каждая строка в <code>...</code> (моноширинный, без голубого фона)
-  const html = lines.map(line => `<code>${esc(line)}</code>`).join('\n');
-  return html;
+  // ВОЗВРАЩАЕМ моноширинный БЕЗ подложки (каждая строка в <code>)
+  return lines.map(line => `<code>${esc(line)}</code>`).join('\n');
 }
 
+/**
+ * Второе сообщение: разбивка по позициям
+ * СТИЛЬ: каждая строка в <code>...</code> (моноширинный без подложки)
+ */
+async function makeSkuBreakdownText(user, date, opts = {}) {
+  const from = `${date}T00:00:00.000Z`;
+  const to   = `${date}T23:59:59.999Z`;
+  const trackedSkus = opts.trackedSkus || null;
+
+  const rows = await getSalesBreakdownBySku({
+    client_id: user.client_id,
+    api_key:   user.seller_api,
+    date_from: from,
+    date_to:   to,
+    trackedSkus,
+  });
+
+  if (!rows.length) {
+    return '<code>Данных по позициям нет.</code>';
+  }
+
+  const out = [];
+  rows.forEach((r, idx) => {
+    out.push(`<code>🔵 ${esc(firstWord(r.name))} (${r.sku})</code>`);
+    out.push(`<code>Заказано: ${Number(r.count).toLocaleString('ru-RU')} шт.</code>`);
+    out.push(`<code>Заказано на сумму: ${formatMoney(r.amount)}₽</code>`);
+    if (idx < rows.length - 1) {
+      out.push('<code></code>');
+      out.push('<code>-------------------</code>');
+      out.push('<code></code>');
+    }
+  });
+
+  return out.join('\n'); // отправлять с parse_mode: 'HTML'
+}
+
+// Сервисные «сегодня/вчера»
 async function makeTodayReportText(user, opts = {}) {
   const date = getTodayISO();
   return makeReportText(user, date, { ...(opts || {}), hideAds: true });
 }
-
 async function makeYesterdayReportText(user, opts = {}) {
   const date = getYesterdayISO();
   return makeReportText(user, date, { ...(opts || {}), hideAds: false });
+}
+async function makeYesterdaySkuBreakdownText(user, opts = {}) {
+  const date = getYesterdayISO();
+  return makeSkuBreakdownText(user, date, opts);
 }
 
 module.exports = {
   makeTodayReportText,
   makeYesterdayReportText,
+  makeSkuBreakdownText,
+  makeYesterdaySkuBreakdownText,
 };
