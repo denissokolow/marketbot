@@ -463,6 +463,101 @@ async function getAverageDeliveryTimeDays({ client_id, api_key }) {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * Суммарные остатки по списку SKU.
+ * POST /v1/analytics/stocks  { skus: ["2583172589", ...] }
+ * Возвращает Map<number, number>: sku -> сумма available_stock_count по всем складам.
+ */
+async function getStocksSumBySkus({ client_id, api_key, skus }) {
+  const list = (Array.isArray(skus) ? skus : []).map(s => String(s)).filter(Boolean);
+  if (!list.length) return new Map();
+
+  const data = await ozonApiRequest({
+    client_id, api_key,
+    endpoint: '/v1/analytics/stocks',
+    body: { skus: list },
+  });
+
+  // Пытаемся быть совместимыми с разными форматами ответа
+  const items = Array.isArray(data?.result?.items) ? data.result.items
+               : Array.isArray(data?.items)        ? data.items
+               : [];
+
+  const out = new Map(); // sku -> sum
+  for (const it of items) {
+    const skuNum = Number(it?.sku || it?.offer_id || 0);
+    if (!Number.isFinite(skuNum)) continue;
+
+    // Формат 1: warehouses: [{ available_stock_count }]
+    let sum = 0;
+    if (Array.isArray(it?.warehouses)) {
+      for (const w of it.warehouses) {
+        const n = Number(w?.available_stock_count ?? 0);
+        if (Number.isFinite(n)) sum += n;
+      }
+    }
+
+    // Формат 2: плоские поля (fallback)
+    const direct = Number(it?.available_stock_count ?? it?.free_to_sell ?? 0);
+    if (Number.isFinite(direct)) sum += direct;
+
+    out.set(skuNum, (out.get(skuNum) || 0) + sum);
+  }
+
+  return out;
+}
+
+/**
+ * Пересчёт "Заказано" и "Заказано на сумму" по каждому SKU за конкретную дату.
+ * Делает POST /v1/analytics/data c dimension ['sku'] и metrics ['revenue','ordered_units'].
+ * Возвращает Map<skuNumber, { ordered:number, revenue:number }>
+ */
+async function getOrderedBySkuMap({ client_id, api_key, date, trackedSkus = null }) {
+  // один запрос на дату, агрегирует разрез по SKU
+  const resp = await ozonApiRequest({
+    client_id,
+    api_key,
+    endpoint: '/v1/analytics/data',
+    body: {
+      date_from: date,
+      date_to: date,
+      metrics: ['revenue', 'ordered_units'],
+      dimension: ['sku'],
+      limit: 1000,
+      offset: 0,
+    },
+  });
+
+  const rows = Array.isArray(resp?.result?.data) ? resp.result.data
+             : Array.isArray(resp?.data)        ? resp.data
+             : [];
+
+  const filter = normalizeSkuFilter(trackedSkus);
+  const only = filter ? new Set(filter) : null;
+
+  const map = new Map(); // sku -> { ordered, revenue }
+
+  for (const row of rows) {
+    // разные варианты представления dimension
+    let skuStr =
+      row?.dimensions?.[0]?.value ??
+      row?.dimensions?.[0]?.id ??
+      row?.dimensions?.[0];
+
+    const sku = Number(String(skuStr).trim());
+    if (!Number.isFinite(sku)) continue;
+    if (only && !only.has(sku)) continue;
+
+    const m = Array.isArray(row?.metrics) ? row.metrics : [];
+    const revenue = Number(m?.[0] || 0);
+    const ordered = Number(m?.[1] || 0);
+
+    map.set(sku, { ordered, revenue });
+  }
+
+  return map;
+}
+
 module.exports = {
   formatMoney,
   ozonApiRequest,
@@ -475,4 +570,6 @@ module.exports = {
   getSalesBreakdownBySku,
   getBuyoutAndProfit,
   getAverageDeliveryTimeDays,
+  getStocksSumBySkus,
+  getOrderedBySkuMap
 };

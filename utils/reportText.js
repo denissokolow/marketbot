@@ -7,6 +7,8 @@ const {
   getBuyoutAndProfit,
   getSalesBreakdownBySku,
   formatMoney,
+  getStocksSumBySkus,
+  getOrderedBySkuMap
 } = require('../ozon');
 const { getCampaignDailyStatsTotals } = require('../services/performanceApi');
 const { getTodayISO, getYesterdayISO } = require('./utils');
@@ -138,19 +140,19 @@ async function makeReportText(user, date, opts = {}) {
   // Формируем строки
   const lines = [];
   lines.push(`🏪 Магазин:  ${padRight(user.shop_name || 'Неизвестно', 0)}`);
-  lines.push('');
+  lines.push(' - - - - ');
   lines.push(`📆 Отчёт за:  ${padRight(date, 0)}`);
-  lines.push('');
-  lines.push(`📦 Заказано товаров:  ${padRight(orderedUnits, 2)}`);
+  lines.push(' - - - - ');
+  lines.push(`📦 Заказано товаров:  ${padRight(orderedUnits, 2)} шт.`);
   lines.push(`💸 Заказано на сумму:  ${padRight(`${formatMoney(revenueOrdered)}₽`, 2)}`);
-  lines.push('');
-  lines.push(`📦 Выкуплено товаров:  ${padRight(stats.totalCount, 2)}`);
+  lines.push(' - - - - ');
+  lines.push(`📦 Выкуплено товаров:  ${padRight(stats.totalCount, 2)} шт.`);
   lines.push(`💸 Выкуплено на сумму:  ${padRight(`${formatMoney(buyoutAmount)}₽`, 2)}`);
   lines.push(`💸 Себестоимость выкупов:  ${padRight(`${formatMoney(stats.buyoutCost)}₽`, 2)}`);
-  lines.push('');
-  lines.push(`📦 Возвраты:  ${padRight(returnsCount, 2)}`);
+  lines.push(' - - - - ');
+  lines.push(`📦 Возвраты:  ${padRight(returnsCount, 2)} шт.`);
   lines.push(`💸 Возвраты на сумму:  ${padRight(`${formatMoney(returnsSum)}₽`, 2)}`);
-  lines.push('');
+  lines.push(' - - - - ');
 
   if (!hideAds) {
     const adSpendLine = adSpendPerf == null ? '-' : `${formatMoney(adSpendPerf)}₽`;
@@ -159,9 +161,9 @@ async function makeReportText(user, date, opts = {}) {
     lines.push(`💸 Расходы на рекламу:  ${padRight(adSpendLine, 2)}`);
     lines.push(`💸 Д.Р.Р:  ${padRight(drrLine, 2)}`);
     lines.push(`💸 CTR:  ${padRight(ctrLine, 2)}`);
-    lines.push('');
+    lines.push(' - - - - ');
     lines.push(`💰 Прибыль:  ${padRight(`${formatMoney(profit)}₽`, 2)}`);
-    lines.push('');
+    lines.push(' - - - - ');
   }
 
   // ВОЗВРАЩАЕМ моноширинный БЕЗ подложки (каждая строка в <code>)
@@ -171,12 +173,16 @@ async function makeReportText(user, date, opts = {}) {
 /**
  * Второе сообщение: разбивка по позициям
  * СТИЛЬ: каждая строка в <code>...</code> (моноширинный без подложки)
+ * Показываем: Заказано, Заказано на сумму (из /v1/analytics/data, dimension=sku),
+ *             Выкуплено, Выкуплено на сумму (из /v3/finance/transaction/list),
+ *             Остаток на складе (из /v1/analytics/stocks).
  */
 async function makeSkuBreakdownText(user, date, opts = {}) {
   const from = `${date}T00:00:00.000Z`;
   const to   = `${date}T23:59:59.999Z`;
   const trackedSkus = opts.trackedSkus || null;
 
+  // 1) Разбивка по выкупам (то, что уже было)
   const rows = await getSalesBreakdownBySku({
     client_id: user.client_id,
     api_key:   user.seller_api,
@@ -189,16 +195,48 @@ async function makeSkuBreakdownText(user, date, opts = {}) {
     return '<code>Данных по позициям нет.</code>';
   }
 
+  // 2) Остатки — одним батчем на все найденные SKU
+  const uniqueSkus = Array.from(new Set(rows.map(r => Number(r.sku)).filter(Number.isFinite)));
+  let stockMap = new Map();
+  try {
+    stockMap = await getStocksSumBySkus({
+      client_id: user.client_id,
+      api_key:   user.seller_api,
+      skus: uniqueSkus,
+    });
+  } catch (e) {
+    console.error('[makeSkuBreakdownText] stocks error:', e?.response?.data || e.message);
+  }
+
+  // 3) Заказано/Заказано на сумму — по вчерашней дате и по SKU
+  let orderedMap = new Map();
+  try {
+    orderedMap = await getOrderedBySkuMap({
+      client_id: user.client_id,
+      api_key:   user.seller_api,
+      date,            // YYYY-MM-DD (вчера)
+      trackedSkus,     // опционально ограничиваем отслеживаемыми
+    });
+  } catch (e) {
+    console.error('[makeSkuBreakdownText] ordered map error:', e?.response?.data || e.message);
+  }
+
   const out = [];
   rows.forEach((r, idx) => {
-    out.push(`<code>🔵 ${esc(firstWord(r.name))} (${r.sku})</code>`);
-    out.push(`<code>Заказано: ${Number(r.count).toLocaleString('ru-RU')} шт.</code>`);
-    out.push(`<code>Заказано на сумму: ${formatMoney(r.amount)}₽</code>`);
-    if (idx < rows.length - 1) {
-      out.push('<code></code>');
-      out.push('<code>-------------------</code>');
-      out.push('<code></code>');
-    }
+    const skuNum = Number(r.sku);
+    const stock  = stockMap.get(skuNum) ?? 0;
+
+    const ord    = orderedMap.get(skuNum) || { ordered: 0, revenue: 0 };
+    const ordQty = Number(ord.ordered) || 0;
+    const ordSum = Number(ord.revenue) || 0;
+    out.push('<code> - - - - </code>');
+    out.push(`<code>🔹 ${esc(firstWord(r.name))} (${r.sku})</code>`);
+    
+    out.push(`<code>📦 Заказано: ${ordQty.toLocaleString('ru-RU')} шт.</code>`);
+    out.push(`<code>💸 Заказано на сумму: ${formatMoney(ordSum)}₽</code>`);
+    out.push(`<code>📦 Выкуплено: ${Number(r.count).toLocaleString('ru-RU')} шт.</code>`);
+    out.push(`<code>💸 Выкуплено на сумму: ${formatMoney(r.amount)}₽</code>`);
+    out.push(`<code>📦 Остаток на складе: ${Number(stock).toLocaleString('ru-RU')} шт.</code>`);
   });
 
   return out.join('\n'); // отправлять с parse_mode: 'HTML'
