@@ -12,6 +12,66 @@ const {
 } = require('../ozon');
 const { getCampaignDailyStatsTotals } = require('../services/performanceApi');
 const { getTodayISO, getYesterdayISO } = require('./utils');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function getOrderedBySkuMapSafe({ client_id, api_key, date, trackedSkus }) {
+  // безопасные ретраи при rate-limit (code:8 / HTTP 429 / 5xx)
+  const MAX_RETRIES = 5;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await getOrderedBySkuMap({ client_id, api_key, date, trackedSkus });
+    } catch (e) {
+      const http = e?.response?.status;
+      const code = e?.response?.data?.code;
+      const msg  = String(e?.response?.data?.message || e?.message || '').toLowerCase();
+      const isRate = http === 429 || code === 8 || msg.includes('rate limit');
+      const is5xx  = http >= 500 && http < 600;
+      if (!isRate && !is5xx) throw e; // не ретраим нефлэткие ошибки
+      if (attempt >= MAX_RETRIES) throw e;
+      // экспоненциальный бэкофф с джиттером
+      const base = 300 * Math.pow(2, attempt); // 300,600,1200,2400,4800
+      const jitter = Math.floor(Math.random() * 200);
+      const ms = Math.min(5000, base + jitter);
+      // можно логировать при отладке:
+      // console.warn('[getOrderedBySkuMapSafe] retry in', ms, 'ms', e?.response?.data || e?.message);
+      await sleep(ms);
+    }
+  }
+  return new Map(); // теоретически недостижимо
+}
+
+// маленький чанкёр на всякий случай для /v1/analytics/stocks
+async function getStocksSumBySkusChunked({ client_id, api_key, skus, chunk = 900 }) {
+  if (!Array.isArray(skus) || !skus.length) return new Map();
+  const out = new Map();
+  for (let i = 0; i < skus.length; i += chunk) {
+    const part = skus.slice(i, i + chunk);
+    try {
+      const m = await getStocksSumBySkus({ client_id, api_key, skus: part });
+      for (const [k, v] of m.entries()) out.set(k, v);
+    } catch (e) {
+      console.error('[makeSkuBreakdownText] stocks error:', e?.response?.data || e.message);
+    }
+  }
+  return out;
+}
+
+async function getTitlesMapFromDB(db, chatId) {
+  if (!db || !chatId) return new Map();
+  const sql = `
+    SELECT sp.sku::bigint AS sku, COALESCE(sp.title, '') AS title
+    FROM shop_products sp
+    JOIN shops s ON s.id = sp.shop_id
+    WHERE s.chat_id = $1
+  `;
+  const r = await db.query(sql, [chatId]);
+  const map = new Map();
+  for (const row of (r.rows || [])) {
+    const sku = Number(row.sku);
+    if (Number.isFinite(sku)) map.set(sku, row.title || '');
+  }
+  return map;
+}
 
 // HTML-экранирование
 function esc(s = '') {
@@ -180,67 +240,134 @@ async function makeReportText(user, date, opts = {}) {
 async function makeSkuBreakdownText(user, date, opts = {}) {
   const from = `${date}T00:00:00.000Z`;
   const to   = `${date}T23:59:59.999Z`;
-  const trackedSkus = opts.trackedSkus || null;
 
-  // 1) Разбивка по выкупам (то, что уже было)
-  const rows = await getSalesBreakdownBySku({
+  // 0) Базовый список SKU — показываем все отслеживаемые
+  const trackedSkus = Array.isArray(opts.trackedSkus) && opts.trackedSkus.length
+    ? [...new Set(opts.trackedSkus.map(Number).filter(Number.isFinite))]
+    : null;
+
+  // 0.1) Карта названий из БД, чтобы корректно именовать SKU без выкупов
+  let titleMap = new Map();
+  if (opts.db && opts.chatId) {
+    try {
+      const r = await opts.db.query(
+        `
+        SELECT sp.sku::bigint AS sku, COALESCE(sp.title, '') AS title
+        FROM shop_products sp
+        JOIN shops s ON s.id = sp.shop_id
+        WHERE s.chat_id = $1
+        `,
+        [opts.chatId]
+      );
+      for (const row of (r.rows || [])) {
+        const skuNum = Number(row.sku);
+        if (Number.isFinite(skuNum)) titleMap.set(skuNum, row.title || '');
+      }
+    } catch (e) {
+      console.error('[makeSkuBreakdownText] title map error:', e?.response?.data || e.message);
+    }
+  }
+
+  // 1) Выкупы по SKU (finance list)
+  const buyouts = await getSalesBreakdownBySku({
     client_id: user.client_id,
     api_key:   user.seller_api,
     date_from: from,
     date_to:   to,
-    trackedSkus,
+    trackedSkus, // если null — без фильтра (но мы всё равно отрисуем только tracked при наличии их)
   });
+  const buyoutBySku = new Map(); // sku -> { count, amount, name }
+  for (const r of buyouts) {
+    const sku = Number(r.sku);
+    if (!Number.isFinite(sku)) continue;
+    buyoutBySku.set(sku, { count: Number(r.count)||0, amount: Number(r.amount)||0, name: r.name || '' });
+  }
 
-  if (!rows.length) {
+  // 2) Заказано по SKU (analytics, dimension=sku) — с ретраями при rate-limit
+  let orderedMap = new Map();
+  try {
+    orderedMap = await getOrderedBySkuMapSafe({
+      client_id: user.client_id,
+      api_key:   user.seller_api,
+      date,
+      trackedSkus: null, // берём полный срез, чтобы не терять позиции с заказами
+    });
+  } catch (e) {
+    console.error('[makeSkuBreakdownText] ordered map error (after retries):', e?.response?.data || e.message);
+  }
+
+  // 3) Итоговый набор SKU для вывода
+  let finalSkus;
+  if (trackedSkus && trackedSkus.length) {
+    finalSkus = trackedSkus;
+  } else {
+    const set = new Set([
+      ...Array.from(buyoutBySku.keys()),
+      ...Array.from(orderedMap.keys()),
+    ]);
+    finalSkus = Array.from(set.values());
+  }
+
+  if (!finalSkus.length) {
     return '<code>Данных по позициям нет.</code>';
   }
 
-  // 2) Остатки — одним батчем на все найденные SKU
-  const uniqueSkus = Array.from(new Set(rows.map(r => Number(r.sku)).filter(Number.isFinite)));
+  // 4) Остатки — одним батчем (с чанками на всякий)
   let stockMap = new Map();
   try {
-    stockMap = await getStocksSumBySkus({
+    stockMap = await getStocksSumBySkusChunked({
       client_id: user.client_id,
       api_key:   user.seller_api,
-      skus: uniqueSkus,
+      skus: finalSkus,
     });
   } catch (e) {
     console.error('[makeSkuBreakdownText] stocks error:', e?.response?.data || e.message);
   }
 
-  // 3) Заказано/Заказано на сумму — по вчерашней дате и по SKU
-  let orderedMap = new Map();
-  try {
-    orderedMap = await getOrderedBySkuMap({
-      client_id: user.client_id,
-      api_key:   user.seller_api,
-      date,            // YYYY-MM-DD (вчера)
-      trackedSkus,     // опционально ограничиваем отслеживаемыми
-    });
-  } catch (e) {
-    console.error('[makeSkuBreakdownText] ordered map error:', e?.response?.data || e.message);
-  }
+  // 5) Собираем строки. Сортировка: активные вверх, затем «нулевые».
+  const rows = finalSkus.map((sku) => {
+    const ord = orderedMap.get(sku) || { ordered: 0, revenue: 0 };
+    const bo  = buyoutBySku.get(sku) || { count: 0, amount: 0, name: '' };
+    const stock = Number(stockMap.get(sku) || 0);
 
-  const out = [];
-  rows.forEach((r, idx) => {
-    const skuNum = Number(r.sku);
-    const stock  = stockMap.get(skuNum) ?? 0;
+    // приоритет имени: shop_products -> имя из выкупов -> "SKU N"
+    const titleFromDb  = titleMap.get(sku) || '';
+    const titleFromOps = bo.name || '';
+    const displayName  = firstWord(titleFromDb || titleFromOps) || `SKU ${sku}`;
 
-    const ord    = orderedMap.get(skuNum) || { ordered: 0, revenue: 0 };
-    const ordQty = Number(ord.ordered) || 0;
-    const ordSum = Number(ord.revenue) || 0;
-    out.push('<code> - - - - </code>');
-    out.push(`<code>🔹 ${esc(firstWord(r.name))} (${r.sku})</code>`);
-    
-    out.push(`<code>📦 Заказано: ${ordQty.toLocaleString('ru-RU')} шт.</code>`);
-    out.push(`<code>💸 Заказано на сумму: ${formatMoney(ordSum)}₽</code>`);
-    out.push(`<code>📦 Выкуплено: ${Number(r.count).toLocaleString('ru-RU')} шт.</code>`);
-    out.push(`<code>💸 Выкуплено на сумму: ${formatMoney(r.amount)}₽</code>`);
-    out.push(`<code>📦 Остаток на складе: ${Number(stock).toLocaleString('ru-RU')} шт.</code>`);
+    return {
+      sku,
+      name: displayName,
+      orderedQty: Number(ord.ordered) || 0,
+      orderedSum: Number(ord.revenue) || 0,
+      buyoutQty:  Number(bo.count) || 0,
+      buyoutSum:  Number(bo.amount) || 0,
+      stock,
+      activeScore: ((Number(bo.amount)||0) > 0 || (Number(ord.revenue)||0) > 0)
+        ? (Number(bo.amount)||0) : -1,
+    };
   });
 
-  return out.join('\n'); // отправлять с parse_mode: 'HTML'
+  rows.sort((a, b) => {
+    if (a.activeScore !== b.activeScore) return b.activeScore - a.activeScore;
+    return a.sku - b.sku;
+  });
+
+  // 6) Рендер
+  const out = [];
+  rows.forEach((r) => {
+    out.push('<code> - - - - </code>');
+    out.push(`<code>🔹 ${esc(r.name)} (${r.sku})</code>`);
+    out.push(`<code>📦 Заказано: ${r.orderedQty.toLocaleString('ru-RU')} шт.</code>`);
+    out.push(`<code>💸 Заказано на сумму: ${formatMoney(r.orderedSum)}₽</code>`);
+    out.push(`<code>📦 Выкуплено: ${r.buyoutQty.toLocaleString('ru-RU')} шт.</code>`);
+    out.push(`<code>💸 Выкуплено на сумму: ${formatMoney(r.buyoutSum)}₽</code>`);
+    out.push(`<code>📦 Остаток на складе: ${r.stock.toLocaleString('ru-RU')} шт.</code>`);
+  });
+
+  return out.join('\n');
 }
+
 
 // Сервисные «сегодня/вчера»
 async function makeTodayReportText(user, opts = {}) {

@@ -4,6 +4,7 @@ const { getTrackedSkusForUser } = require('../utils/dbHelpers.js');
 
 module.exports = (bot, db) => {
   bot.command('report_today', async ctx => {
+     
     const r = await db.query('SELECT * FROM users WHERE chat_id=$1', [ctx.from.id]);
     const user = r?.rows?.[0];
     if (!user) return ctx.reply('Сначала зарегистрируйтесь через /start');

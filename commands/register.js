@@ -170,39 +170,56 @@ module.exports = (bot, db) => {
 
         await db.query('COMMIT');
 
-        // Вне транзакции: подтянуть остатки и пересобрать shop_products
-        try {
-          const items = await fetchStocksPositiveBySku({
-            client_id: state.client_id,
-            api_key: state.seller_api,
-          });
+        // Вне транзакции: подтянуть остатки и апсертом обновить shop_products
+try {
+  const items = await fetchStocksPositiveBySku({
+    client_id: state.client_id,
+    api_key: state.seller_api,
+  });
 
-          if (shopId) {
-            await db.query('DELETE FROM shop_products WHERE shop_id = $1', [shopId]);
+  if (shopId) {
+    await db.query('BEGIN');
 
-            if (items.length) {
-              const values = [];
-              const params = [];
-              let p = 1;
+    // 1) обнуляем quantity у всех товаров магазина
+    await db.query('UPDATE shop_products SET quantity = 0 WHERE shop_id = $1', [shopId]);
 
-              for (const it of items) {
-                values.push(`($${p++}, $${p++}, $${p++}, $${p++})`);
-                params.push(shopId, it.sku, it.title, it.quantity);
-              }
+    // 2) апсертом заливаем текущие позиции с положительным остатком
+    if (items.length) {
+      const values = [];
+      const params = [];
+      let p = 1;
 
-              await db.query(
-                `INSERT INTO shop_products (shop_id, sku, title, quantity) VALUES ${values.join(',')}`,
-                params
-              );
-            }
-          }
-        } catch (e) {
-          console.error('Ошибка загрузки/сохранения остатков:', e?.response?.data || e);
-          // регистрация всё равно завершена
-        }
+      for (const it of items) {
+        values.push(`($${p++}, $${p++}, $${p++}, $${p++})`);
+        params.push(
+          shopId,
+          it.sku,
+          String(it.title || ''),
+          Number(it.quantity || 0)
+        );
+      }
 
-        await ctx.reply('Вы успешно зарегистрированы!', mainMenu());
-        delete regSteps[chat_id];
+      await db.query(
+        `INSERT INTO shop_products (shop_id, sku, title, quantity)
+         VALUES ${values.join(',')}
+         ON CONFLICT (shop_id, sku) DO UPDATE
+           SET title = EXCLUDED.title,
+               quantity = EXCLUDED.quantity`,
+        params
+      );
+      // ВАЖНО: новые строки получат tracked=TRUE за счёт DEFAULT; существующие сохранят своё tracked
+    }
+
+    await db.query('COMMIT');
+  }
+} catch (e) {
+  try { await db.query('ROLLBACK'); } catch {}
+  console.error('Ошибка загрузки/сохранения остатков:', e?.response?.data || e);
+  // регистрация всё равно завершена
+}
+
+await ctx.reply('Вы успешно зарегистрированы!', mainMenu());
+delete regSteps[chat_id];
       }
     } catch (err) {
       try { await db.query('ROLLBACK'); } catch {}

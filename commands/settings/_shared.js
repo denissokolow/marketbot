@@ -2,7 +2,8 @@ const { Markup } = require('telegraf');
 
 const CB = {
   MAIN:        'set_main',
-  PROFILE:     'set_prof',
+  PROFILE: 'profile',
+  PROFILE_SHOP: 'profile_shop',
 
   SHOPS:       'set_shops',
   SHOP_OPEN:   'set_shop',     // set_shop:<shopId>
@@ -21,6 +22,8 @@ const CB = {
   DEL_SHOP:    'set_del_shop',
   DEL_CONF:    'set_del_conf',   // set_del_conf:<shopId>
   DEL_DO:      'set_del_do',     // set_del_do:<shopId>
+
+
 };
 
 const PAGE_SIZE = 10;
@@ -54,7 +57,7 @@ async function sendOrEdit(ctx, text, keyboard) {
 function mainKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('👤 Профиль', CB.PROFILE)],
-    [Markup.button.callback('🏬 Магазины', CB.SHOPS)],
+    [Markup.button.callback('🏬 Магазин', CB.SHOPS)],
   ]);
 }
 

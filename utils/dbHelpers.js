@@ -1,23 +1,21 @@
-// utils/dbHelpers.js
-async function getTrackedSkusForUser(db, chatId) {
+async function getTrackedSkusForUser(db, chatId, { stockOnly = false } = {}) {
+  const stockClause = stockOnly ? 'AND sp.quantity > 0' : '';
   const sql = `
     SELECT DISTINCT
-      regexp_replace(tp.sku::text, '\\s+', '', 'g')::bigint AS sku
-    FROM tracked_products tp
-    JOIN shops s ON s.id = tp.shop_id
+      regexp_replace(sp.sku::text, '\\s+', '', 'g')::bigint AS sku
+    FROM shop_products sp
+    JOIN shops s ON s.id = sp.shop_id
     WHERE s.chat_id = $1
-      AND tp.is_active = TRUE
+      AND sp.tracked = TRUE
+      ${stockClause}
   `;
   const res = await db.query(sql, [chatId]);
   const list = res.rows
     .map(r => Number(r.sku))
     .filter(n => Number.isFinite(n));
 
-  console.log('[getTrackedSkusForUser] active SKUs:', list);
-  return list; // массив чисел
+  console.log('[getTrackedSkusForUser]', { stockOnly, skus: list });
+  return list;
 }
 
 module.exports = { getTrackedSkusForUser };
-
-
-

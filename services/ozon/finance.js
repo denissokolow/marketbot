@@ -6,11 +6,11 @@ const { normalizeSkuFilter } = require('./utils');
 async function getCostsMapFromDB(db, chatId) {
   if (!db || !chatId) return new Map();
   const sql = `
-    SELECT tp.sku::bigint AS sku, COALESCE(tp.net, 0)::numeric AS net
-    FROM tracked_products tp
-    JOIN shops s ON s.id = tp.shop_id
+    SELECT sp.sku::bigint AS sku, COALESCE(sp.net, 0)::numeric AS net
+    FROM shop_products sp
+    JOIN shops s ON s.id = sp.shop_id
     WHERE s.chat_id = $1
-      AND tp.is_active = TRUE
+      AND sp.tracked = TRUE
   `;
   const r = await db.query(sql, [chatId]);
   const map = new Map();
