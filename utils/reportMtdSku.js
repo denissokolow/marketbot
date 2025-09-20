@@ -3,10 +3,12 @@
 // Для каждого отслеживаемого SKU выводим:
 //  - Заказано (шт. и сумма) из /v1/analytics/data (dimension=sku)
 //  - Выкуплено: нетто-шт. (брутто-шт. − возвраты-шт.), сумма = Σ положительных accruals_for_sale (брутто-выручка)
-//  - ⭕️ Расходы: Σ |sale_commission| + |processing_and_delivery| + |delivery_charge| + Σ |services[]| + |negative residual| (всё распределено по SKU)
-//  - Доставляется: из /v2/posting/fbo/list (status = delivering)
-//  - Возвраты (шт.): из /v1/returns/list по logistic_return_date (пагинация last_id)
-//  - Прибыль = Выкуплено(брутто-выручка) − Расходы − Себестоимость(по брутто-шт.)
+//  - ▪️ Расходы: Σ |sale_commission| + |processing_and_delivery...| + Σ |services[]| + |negative residual| (всё распределено по SKU)
+//  - ▪️ Доставляется: из /v2/posting/fbo/list (status = delivering)
+//  - ▪️ Возвраты (шт.): из /v1/returns/list по logistic_return_date (пагинация last_id)
+//  - ▪️ Брак (шт.): количество возвратов, где return_reason_name содержит «брак» (регистронезависимо)
+//  - ▪️ Процент выкупа: (выкуплено шт) / (заказано шт − доставляется шт) * 100
+//  - ▪️ Прибыль = Выкуплено(брутто-выручка) − Расходы − Себестоимость(по брутто-шт.)
 
 const { ozonApiRequest } = require('../services/ozon/api');
 const { getTodayISO, getYesterdayISO } = require('./utils');
@@ -16,6 +18,7 @@ const esc = (s = '') => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').rep
 const firstWord = (s = '') => (String(s).trim().split(/\s+/)[0] || '');
 const fmtMoney0 = (n) => Math.round(Number(n) || 0).toLocaleString('ru-RU');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const includesBrak = (s) => typeof s === 'string' && s.toLowerCase().includes('брак');
 
 const DEBUG_MTD         = process.env.DEBUG_MTD === '1';
 const DEBUG_MTD_DETAILS = process.env.DEBUG_MTD_DETAILS === '1';
@@ -62,14 +65,14 @@ async function getCostsMapForTracked(db, chatId, trackedSkus) {
   `;
   const r = await db.query(sql, [chatId, skus]);
   const map = new Map();
-  for (const row of r.rows || []) {
+  for (const row of (r.rows || [])) {
     const sku = Number(row.sku);
     if (Number.isFinite(sku)) map.set(sku, Number(row.net) || 0);
   }
   return map;
 }
 
-// ---------- analytics: разрез по SKU (bulk) ----------
+// ---------- analytics: заказы и выручка по SKU (bulk с пагинацией offset/limit) ----------
 async function fetchAnalyticsSkuBulk({ client_id, api_key, date_from_ymd, date_to_ymd }) {
   const limit = 1000;
   let offset = 0;
@@ -86,8 +89,7 @@ async function fetchAnalyticsSkuBulk({ client_id, api_key, date_from_ymd, date_t
             date_to:   date_to_ymd,
             metrics:   ['revenue', 'ordered_units'],
             dimension: ['sku'],
-            filters:   [],
-            sort:      [{ order: 'DESC' }],
+            sort: [{ key: 'revenue', order: 'DESC' }],
             limit,
             offset,
           },
@@ -106,7 +108,7 @@ async function fetchAnalyticsSkuBulk({ client_id, api_key, date_from_ymd, date_t
       break;
     } catch (e) {
       const code = e?.response?.data?.code ?? e?.code;
-      if (code === 8 && attempt < OZON_MAX_RETRIES) {
+      if (code === 429 && attempt < OZON_MAX_RETRIES - 1) {
         const pause = OZON_BACKOFF_BASE_MS * Math.pow(2, attempt);
         if (DEBUG_MTD) console.warn(`[analytics:bulk] rate-limit, retry ${attempt + 1}/${OZON_MAX_RETRIES} after ${pause}ms`);
         await sleep(pause);
@@ -148,13 +150,17 @@ async function fetchFinanceOpsAll({ client_id, api_key, fromISO, toISO }) {
         if (DEBUG_MTD) console.log('[finance:list] page', { page, got: ops.length });
 
         out.push(...ops);
-        if (ops.length < page_size) break;
-        page += 1;
+
+        if (resp?.result?.has_next === true) {
+          page += 1;
+        } else {
+          break;
+        }
       }
       break;
     } catch (e) {
       const code = e?.response?.data?.code ?? e?.code;
-      if (code === 8 && attempt < OZON_MAX_RETRIES) {
+      if (code === 429 && attempt < OZON_MAX_RETRIES - 1) {
         const pause = OZON_BACKOFF_BASE_MS * Math.pow(2, attempt);
         if (DEBUG_MTD) console.warn(`[finance:list] rate-limit, retry ${attempt + 1}/${OZON_MAX_RETRIES} after ${pause}ms`);
         await sleep(pause);
@@ -168,7 +174,7 @@ async function fetchFinanceOpsAll({ client_id, api_key, fromISO, toISO }) {
   return out;
 }
 
-// ---------- postings FBO: считаем «Доставляется» (status = delivering) ----------
+// ---------- postings(FBO): доставляется ----------
 async function fetchFboDeliveringCounts({ client_id, api_key, fromISO, toISO, trackedSet }) {
   const limit = 1000;
   let offset = 0;
@@ -184,13 +190,13 @@ async function fetchFboDeliveringCounts({ client_id, api_key, fromISO, toISO, tr
             filter: {
               since: fromISO,
               to: toISO,
-              status: '',
+              status: 'delivering', // фильтр на стороне API
             },
             limit,
             offset,
-            translit: true,
+            translit: false,
             with: {
-              analytics_data: true,
+              analytics_data: false,
               financial_data: true,
               legal_info: false,
             },
@@ -223,7 +229,7 @@ async function fetchFboDeliveringCounts({ client_id, api_key, fromISO, toISO, tr
       break;
     } catch (e) {
       const code = e?.response?.data?.code ?? e?.code;
-      if (code === 8 && attempt < OZON_MAX_RETRIES) {
+      if (code === 429 && attempt < OZON_MAX_RETRIES - 1) {
         const pause = OZON_BACKOFF_BASE_MS * Math.pow(2, attempt);
         if (DEBUG_MTD) console.warn(`[fbo:list] rate-limit, retry ${attempt + 1}/${OZON_MAX_RETRIES} after ${pause}ms`);
         await sleep(pause);
@@ -237,12 +243,14 @@ async function fetchFboDeliveringCounts({ client_id, api_key, fromISO, toISO, tr
   return counts;
 }
 
-// ---------- returns: корректный сбор возвратов по last_id и logistic_return_date ----------
-async function fetchReturnsCounts({ client_id, api_key, fromISO, toISO, trackedSet }) {
+// ---------- returns: сбор возвратов + подсчёт «брака» ----------
+async function fetchReturnsStats({ client_id, api_key, fromISO, toISO, trackedSet }) {
   const limit = 500; // строго <= 500
   let last_id = 0;
-  const counts = new Map(); // sku -> qty
-  const seen = new Set();   // для дедупа по id/композиту
+
+  const counts = new Map();     // sku -> qty (все возвраты)
+  const brakCounts = new Map(); // sku -> qty (только где reason содержит «брак»)
+  const seen = new Set();       // дедуп по id/композиту
 
   for (let attempt = 0; ; attempt++) {
     try {
@@ -263,9 +271,7 @@ async function fetchReturnsCounts({ client_id, api_key, fromISO, toISO, trackedS
         });
 
         const result = resp?.result || resp || {};
-        const items = Array.isArray(result?.returns) ? result.returns
-                     : Array.isArray(result)         ? result
-                     : [];
+        const items = Array.isArray(result?.returns) ? result.returns : [];
 
         if (DEBUG_MTD) {
           const dbgLast = (result?.last_id ?? last_id);
@@ -291,7 +297,17 @@ async function fetchReturnsCounts({ client_id, api_key, fromISO, toISO, trackedS
           if (seen.has(key)) continue;
           seen.add(key);
 
-          counts.set(sku, (counts.get(sku) || 0) + 1);
+          const qty = Number(rt?.quantity ?? rt?.return_count ?? rt?.qty ?? 1);
+          const q = Number.isFinite(qty) ? qty : 1;
+
+          // наращиваем общий счётчик
+          counts.set(sku, (counts.get(sku) || 0) + q);
+
+          // если в причине есть "брак" — учитываем отдельно
+          const reason = rt?.return_reason_name || rt?.reason || '';
+          if (includesBrak(reason)) {
+            brakCounts.set(sku, (brakCounts.get(sku) || 0) + q);
+          }
         }
 
         const next = Number(result?.last_id ?? 0);
@@ -301,7 +317,7 @@ async function fetchReturnsCounts({ client_id, api_key, fromISO, toISO, trackedS
       break;
     } catch (e) {
       const code = e?.response?.data?.code ?? e?.code;
-      if (code === 8 && attempt < OZON_MAX_RETRIES) {
+      if (code === 429 && attempt < OZON_MAX_RETRIES - 1) {
         const pause = OZON_BACKOFF_BASE_MS * Math.pow(2, attempt);
         if (DEBUG_MTD) console.warn(`[returns:list] rate-limit, retry ${attempt + 1}/${OZON_MAX_RETRIES} after ${pause}ms`);
         await sleep(pause);
@@ -312,7 +328,7 @@ async function fetchReturnsCounts({ client_id, api_key, fromISO, toISO, trackedS
     }
   }
 
-  return counts;
+  return { counts, brakCounts };
 }
 
 // построим «веса» по товарам в рамках одного posting_number
@@ -413,7 +429,8 @@ async function makeMtdPerSkuText(user, { trackedSkus = [], db = null, chatId = n
 
         if (!nameBySku.has(sku) && it?.name) nameBySku.set(sku, String(it.name));
       }
-    } else {
+    }
+    if (weights.size === 0) {
       const base = basePosting(op?.posting_number || '');
       const g = base ? groupItems.get(base) : null;
       if (g) g.forEach((w, sku) => { if (trackedSet.has(sku)) weights.set(sku, (weights.get(sku)||0)+w); });
@@ -472,22 +489,25 @@ async function makeMtdPerSkuText(user, { trackedSkus = [], db = null, chatId = n
     }
   }
 
-  // 4) «Доставляется» и «Возвраты»
-  const inTransitMap = await fetchFboDeliveringCounts({
-    client_id: user.client_id,
-    api_key:   user.seller_api,
-    fromISO,
-    toISO,
-    trackedSet,
-  });
-
-  const returnsMap = await fetchReturnsCounts({
-    client_id: user.client_id,
-    api_key:   user.seller_api,
-    fromISO,
-    toISO,
-    trackedSet,
-  });
+  // 4) «Доставляется» и «Возвраты + брак» (в параллели)
+  const [inTransitMap, returnsStats] = await Promise.all([
+    fetchFboDeliveringCounts({
+      client_id: user.client_id,
+      api_key:   user.seller_api,
+      fromISO,
+      toISO,
+      trackedSet,
+    }),
+    fetchReturnsStats({
+      client_id: user.client_id,
+      api_key:   user.seller_api,
+      fromISO,
+      toISO,
+      trackedSet,
+    }),
+  ]);
+  const returnsMap   = returnsStats.counts;
+  const brakMap      = returnsStats.brakCounts;
 
   // ---------- шапка ----------
   const lines = [];
@@ -500,15 +520,14 @@ async function makeMtdPerSkuText(user, { trackedSkus = [], db = null, chatId = n
   const orderSkus = [...tracked].sort((a, b) => {
     const ra = Number(agg.get(a)?.grossAccrPos || 0);
     const rb = Number(agg.get(b)?.grossAccrPos || 0);
-    if (ra !== rb) return rb - ra;
+    if (rb !== ra) return rb - ra;
     return a - b;
   });
 
-  // ---------- блоки по SKU ----------
   let totalProfit = 0;
 
   for (const sku of orderSkus) {
-    const ord = orderedMap.get(sku) || { ordered: 0, revenue: 0 };
+    const ord = orderedMap.get(sku) || { ordered:0, revenue:0 };
     const a   = agg.get(sku)       || { grossAccrPos:0, posCnt:0, negCnt:0, expenses:0 };
     const net = Number(costsMap.get(sku) || 0);
 
@@ -525,19 +544,30 @@ async function makeMtdPerSkuText(user, { trackedSkus = [], db = null, chatId = n
     const display  = firstWord(titleApi) || `SKU ${sku}`;
     const inTransitQty = Number(inTransitMap.get(sku) || 0);
     const returnsQty   = Number(returnsMap.get(sku) || 0);
+    const brakQty      = Number(brakMap.get(sku) || 0);
 
     // формат "нет" при нуле
     const qtyLine = (n) => Number(n) ? `${Math.round(Number(n)).toLocaleString('ru-RU')} шт.` : 'нет';
     const qtyMoneyLine = (qty, sum) =>
       Number(qty) ? `${Math.round(Number(qty)).toLocaleString('ru-RU')} шт. на ${fmtMoney0(sum)}₽` : 'нет';
 
+    // процент выкупа = выкуплено шт / (заказано шт - доставляется шт) * 100
+    const denom = Math.max(0, Number(ord.ordered || 0) - Number(inTransitQty || 0));
+    let pickupPercentStr = 'н/д';
+    if (denom > 0) {
+      const pct = Math.max(0, Math.min(100, Math.round((netCnt / denom) * 100)));
+      pickupPercentStr = `${pct}%`;
+    }
+
     lines.push(`<code>🔹 ${esc(display)} (${sku})</code>`);
-    lines.push(`<code>📦 Заказано: ${qtyMoneyLine(ord.ordered, ord.revenue)}</code>`);
-    lines.push(`<code>✅ Выкуплено: ${qtyMoneyLine(netCnt, grossRev)}</code>`);
-    lines.push(`<code>⭕️ Расходы: ${Number(expenses) ? `${fmtMoney0(expenses)}₽` : 'нет'}</code>`);
-    lines.push(`<code>🚚 Доставляется: ${qtyLine(inTransitQty)}</code>`);
-    lines.push(`<code>🔁 Возвраты: ${returnsQty ? `${returnsQty.toLocaleString('ru-RU')} шт.` : 'нет'}</code>`);
-    lines.push(`<code>💰 Прибыль: ${Number(profit) ? `${fmtMoney0(profit)}₽` : 'нет'}</code>`);
+    lines.push(`<code>▫️ Заказано: ${qtyMoneyLine(ord.ordered, ord.revenue)}</code>`);
+    lines.push(`<code>▫️ Выкуплено: ${qtyMoneyLine(netCnt, grossRev)}</code>`);
+    lines.push(`<code>▫️ Доставляется: ${qtyLine(inTransitQty)}</code>`);
+    lines.push(`<code>▫️ Расходы: ${Number(expenses) ? `${fmtMoney0(expenses)}₽` : 'нет'}</code>`);
+    lines.push(`<code>▫️ Возвраты: ${returnsQty ? `${returnsQty.toLocaleString('ru-RU')} шт.` : 'нет'}</code>`);
+    lines.push(`<code>▫️ Брак (в возвратах): ${brakQty ? `${brakQty.toLocaleString('ru-RU')} шт.` : 'нет'}</code>`);
+    lines.push(`<code>▫️ Процент выкупа: ${pickupPercentStr}</code>`);
+    lines.push(`<code>▫️ Прибыль: ${Number(profit) ? `${fmtMoney0(profit)}₽` : 'нет'}</code>`);
     lines.push('<code> - - - - </code>');
 
     if (DEBUG_MTD_DETAILS) {
@@ -549,12 +579,14 @@ async function makeMtdPerSkuText(user, { trackedSkus = [], db = null, chatId = n
   Себестоимость:   ${Math.round(grossUnits)} × ${fmtMoney0(net)} ₽ = ${fmtMoney0(costTotal)} ₽
   Доставляется:    ${inTransitQty}
   Возвраты (v1):   ${returnsQty}
+  Брак (reason):   ${brakQty}
+  Процент выкупа:  ${pickupPercentStr}
   ⇒ Прибыль:       ${fmtMoney0(profit)} ₽`);
     }
   }
 
   // итог по прибыли
-  lines.push(`<code>💰 Общая прибыль: ${fmtMoney0(totalProfit)}₽</code>`);
+  lines.push(`<code>▪️ Общая прибыль: ${fmtMoney0(totalProfit)}₽</code>`);
 
   return lines.join('\n');
 }
