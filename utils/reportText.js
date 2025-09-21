@@ -10,10 +10,19 @@ const {
   getStocksSumBySkus,
   getOrderedBySkuMap
 } = require('../ozon');
-const { getCampaignDailyStatsTotals } = require('../services/performanceApi');
+
+const { ozonApiRequest } = require('../services/ozon/api');
+const { getPerSkuStatsFromDaily, getCampaignDailyStatsTotals } = require('../services/performanceApi');
 const { getTodayISO, getYesterdayISO } = require('./utils');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ---------- ENV пороги для второго сообщения ----------
+const YEST_RETURNS_WARN_GT = Number(process.env.YEST_RETURNS_WARN_GT ?? 0); // Возвраты > → ❗
+const YEST_BRAK_WARN_GT    = Number(process.env.YEST_BRAK_WARN_GT ?? 0);    // Брак > → ❗
+const YEST_STOCK_WARN_LT   = Number(process.env.YEST_STOCK_WARN_LT ?? 10);  // Остаток < → ❗
+const MTD_DRR_WARN_GT      = Number(process.env.MTD_DRR_WARN_GT ?? 10);     // Д.Р.Р. > → ❗
+
+// --------------------------------- Вспомогательные ---------------------------------
 async function getOrderedBySkuMapSafe({ client_id, api_key, date, trackedSkus }) {
   // безопасные ретраи при rate-limit (code:8 / HTTP 429 / 5xx)
   const MAX_RETRIES = 5;
@@ -32,8 +41,6 @@ async function getOrderedBySkuMapSafe({ client_id, api_key, date, trackedSkus })
       const base = 300 * Math.pow(2, attempt); // 300,600,1200,2400,4800
       const jitter = Math.floor(Math.random() * 200);
       const ms = Math.min(5000, base + jitter);
-      // можно логировать при отладке:
-      // console.warn('[getOrderedBySkuMapSafe] retry in', ms, 'ms', e?.response?.data || e?.message);
       await sleep(ms);
     }
   }
@@ -102,10 +109,10 @@ function firstWord(s = '') {
   return String(s).trim().split(/\s+/)[0] || '';
 }
 
-/**
- * Основной отчёт за дату
- * СТИЛЬ: каждая строка в <code>...</code> (моноширинный без подложки)
- */
+// «в названии причины возврата есть "брак"»
+const includesBrak = (s) => typeof s === 'string' && s.toLowerCase().includes('брак');
+
+// --------------------------------- Первое сообщение (без изменений по форме) ---------------------------------
 async function makeReportText(user, date, opts = {}) {
   const from = `${date}T00:00:00.000Z`;
   const to   = `${date}T23:59:59.999Z`;
@@ -152,7 +159,7 @@ async function makeReportText(user, date, opts = {}) {
   });
 
   // 4) Прибыль
-  const { buyoutAmount, profit /*, services_amount*/ } = await getBuyoutAndProfit({
+  const { buyoutAmount, profit } = await getBuyoutAndProfit({
     client_id:  user.client_id,
     api_key:    user.seller_api,
     date_from:  from,
@@ -161,7 +168,7 @@ async function makeReportText(user, date, opts = {}) {
     buyoutAmount: stats.totalAmount,
   });
 
-  // --- реклама Performance ---
+  // --- реклама Performance (итоги за день) ---
   let adSpendPerf = null, ctrPerf = null, drrPerf = null;
   if (!hideAds) {
     try {
@@ -230,12 +237,70 @@ async function makeReportText(user, date, opts = {}) {
   return lines.map(line => `<code>${esc(line)}</code>`).join('\n');
 }
 
+// ---------------------------- ВСПОМОГАТЕЛЬНОЕ: возвраты/брак за день по SKU ----------------------------
+async function getReturnsBySkuForDate({ client_id, api_key, date }) {
+  const fromISO = `${date}T00:00:00.000Z`;
+  const toISO   = `${date}T23:59:59.999Z`;
+  const limit = 500;
+  let last_id = 0;
+  const counts = new Map();     // sku -> qty
+  const brakCounts = new Map(); // sku -> qty
+  const seen = new Set();
+
+  while (true) {
+    const resp = await ozonApiRequest({
+      client_id, api_key,
+      endpoint: '/v1/returns/list',
+      body: { filter: { logistic_return_date: { time_from: fromISO, time_to: toISO } }, limit, last_id },
+    });
+    const items = resp?.result?.returns || [];
+    if (!items.length) break;
+
+    for (const it of items) {
+      const sku = Number(it?.sku ?? it?.product?.sku ?? it?.product_id?.sku ?? 0);
+      if (!Number.isFinite(sku)) continue;
+
+      const id  = it?.id ?? it?.return_id ?? it?.acceptance_id ?? null;
+      const pn  = it?.posting_number || it?.posting?.posting_number || '';
+      const idx = it?.item_index ?? it?.item_id ?? it?.index ?? 0;
+      const key = id != null ? `id:${id}` : `pn:${pn}|sku:${sku}|idx:${idx}`;
+      if (seen.has(key)) continue; seen.add(key);
+
+      const q = Number.isFinite(Number(it?.quantity))
+        ? Number(it?.quantity)
+        : Number.isFinite(Number(it?.return_count)) ? Number(it?.return_count)
+        : Number.isFinite(Number(it?.qty)) ? Number(it?.qty)
+        : 1;
+
+      counts.set(sku, (counts.get(sku) || 0) + q);
+
+      const reason = it?.return_reason_name || it?.reason || '';
+      if (includesBrak(reason)) {
+        brakCounts.set(sku, (brakCounts.get(sku) || 0) + q);
+      }
+    }
+
+    const next = Number(resp?.result?.last_id ?? 0);
+    if (!next || next === last_id) break;
+    last_id = next;
+  }
+
+  return { counts, brakCounts };
+}
+
+// --------------------------------- Второе сообщение (обновлённый формат) ---------------------------------
 /**
- * Второе сообщение: разбивка по позициям
- * СТИЛЬ: каждая строка в <code>...</code> (моноширинный без подложки)
- * Показываем: Заказано, Заказано на сумму (из /v1/analytics/data, dimension=sku),
- *             Выкуплено, Выкуплено на сумму (из /v3/finance/transaction/list),
- *             Остаток на складе (из /v1/analytics/stocks).
+ * Второе сообщение: разбивка по позициям ЗА ВЧЕРА.
+ * Формат по требованиям:
+ * 📆 Отчёт за:  YYYY-MM-DD
+ * 📦 Название (sku)
+ * ▫️ Заказано: N шт. на S₽
+ * ▫️ Выкуплено: N шт. на S₽
+ * ▫️ Возвраты: N шт.   (❗ если > YEST_RETURNS_WARN_GT)
+ * ▫️ Брак (в возвратах): N шт. (❗ если > YEST_BRAK_WARN_GT)
+ * ▫️ Остаток на складе: N шт.  (❗ если < YEST_STOCK_WARN_LT)
+ * ▫️/❗ Д.Р.Р.: X,XX%   (❗ если > MTD_DRR_WARN_GT)
+ *  - - - - 
  */
 async function makeSkuBreakdownText(user, date, opts = {}) {
   const from = `${date}T00:00:00.000Z`;
@@ -274,7 +339,7 @@ async function makeSkuBreakdownText(user, date, opts = {}) {
     api_key:   user.seller_api,
     date_from: from,
     date_to:   to,
-    trackedSkus, // если null — без фильтра (но мы всё равно отрисуем только tracked при наличии их)
+    trackedSkus, // если null — без фильтра
   });
   const buyoutBySku = new Map(); // sku -> { count, amount, name }
   for (const r of buyouts) {
@@ -283,14 +348,14 @@ async function makeSkuBreakdownText(user, date, opts = {}) {
     buyoutBySku.set(sku, { count: Number(r.count)||0, amount: Number(r.amount)||0, name: r.name || '' });
   }
 
-  // 2) Заказано по SKU (analytics, dimension=sku) — с ретраями при rate-limit
+  // 2) Заказано по SKU (analytics, dimension=sku) — с ретраями
   let orderedMap = new Map();
   try {
     orderedMap = await getOrderedBySkuMapSafe({
       client_id: user.client_id,
       api_key:   user.seller_api,
       date,
-      trackedSkus: null, // берём полный срез, чтобы не терять позиции с заказами
+      trackedSkus: null, // берём полный срез
     });
   } catch (e) {
     console.error('[makeSkuBreakdownText] ordered map error (after retries):', e?.response?.data || e.message);
@@ -307,12 +372,9 @@ async function makeSkuBreakdownText(user, date, opts = {}) {
     ]);
     finalSkus = Array.from(set.values());
   }
+  if (!finalSkus.length) return '<code>Данных по позициям нет.</code>';
 
-  if (!finalSkus.length) {
-    return '<code>Данных по позициям нет.</code>';
-  }
-
-  // 4) Остатки — одним батчем (с чанками на всякий)
+  // 4) Остатки — батчами
   let stockMap = new Map();
   try {
     stockMap = await getStocksSumBySkusChunked({
@@ -324,52 +386,109 @@ async function makeSkuBreakdownText(user, date, opts = {}) {
     console.error('[makeSkuBreakdownText] stocks error:', e?.response?.data || e.message);
   }
 
-  // 5) Собираем строки. Сортировка: активные вверх, затем «нулевые».
-  const rows = finalSkus.map((sku) => {
+  // 5) Возвраты/брак за день по SKU
+  const { counts: returnsMap, brakCounts: brakMap } = await getReturnsBySkuForDate({
+    client_id: user.client_id,
+    api_key:   user.seller_api,
+    date,
+  });
+
+  // 6) Д.Р.Р. за день по SKU через Performance API
+  let drrBySku = new Map();
+  if (opts.db && opts.chatId && typeof getPerSkuStatsFromDaily === 'function') {
+    try {
+      const rr = await opts.db.query(`
+        SELECT performance_client_id, performance_secret
+          FROM shops
+         WHERE chat_id = $1
+           AND performance_client_id IS NOT NULL
+           AND performance_secret IS NOT NULL
+         ORDER BY id
+         LIMIT 1
+      `, [opts.chatId]);
+
+      if (rr.rowCount) {
+        const perfId     = rr.rows[0].performance_client_id;
+        const perfSecret = rr.rows[0].performance_secret;
+        // веса для «все товары» — пропорционально выручке за день
+        const allocationWeights = {};
+        for (const sku of finalSkus) {
+          allocationWeights[sku] = Number(orderedMap.get(sku)?.revenue || 0);
+        }
+        const perSku = await getPerSkuStatsFromDaily({
+          client_id:  perfId,
+          client_secret: perfSecret,
+          date_from:  date,
+          date_to:    date,
+          trackedSkus: finalSkus,
+          allocationWeights,
+        });
+        drrBySku = new Map();
+        for (const sku of finalSkus) {
+          const adv = perSku.get(sku);
+          const spent = Number(adv?.spent || 0);
+          const rev   = Number(orderedMap.get(sku)?.revenue || 0);
+          const drr   = rev > 0 ? (spent / rev) * 100 : null;
+          if (drr != null) drrBySku.set(sku, drr);
+        }
+      }
+    } catch (e) {
+      console.warn('[makeSkuBreakdownText] Performance daily per-sku error:', e?.response?.status, e?.message);
+    }
+  }
+
+  // 7) Рендер
+  const lines = [];
+  lines.push(`<code>📆 Отчёт за:  ${esc(date)}</code>`);
+  lines.push('<code> - - - - </code>');
+
+  // Сортировка: по выручке за день
+  const orderedSkus = [...new Set(finalSkus)].sort((a,b) => {
+    const ra = Number(orderedMap.get(a)?.revenue || 0);
+    const rb = Number(orderedMap.get(b)?.revenue || 0);
+    return rb - ra || a - b;
+  });
+
+  for (const sku of orderedSkus) {
     const ord = orderedMap.get(sku) || { ordered: 0, revenue: 0 };
     const bo  = buyoutBySku.get(sku) || { count: 0, amount: 0, name: '' };
     const stock = Number(stockMap.get(sku) || 0);
+    const retQty = Number(returnsMap.get(sku) || 0);
+    const brakQty = Number(brakMap.get(sku) || 0);
+    const drr = drrBySku.has(sku) ? drrBySku.get(sku) : null;
 
-    // приоритет имени: shop_products -> имя из выкупов -> "SKU N"
+    // имя: приоритет DB -> из выкупов -> SKU N
     const titleFromDb  = titleMap.get(sku) || '';
     const titleFromOps = bo.name || '';
     const displayName  = firstWord(titleFromDb || titleFromOps) || `SKU ${sku}`;
 
-    return {
-      sku,
-      name: displayName,
-      orderedQty: Number(ord.ordered) || 0,
-      orderedSum: Number(ord.revenue) || 0,
-      buyoutQty:  Number(bo.count) || 0,
-      buyoutSum:  Number(bo.amount) || 0,
-      stock,
-      activeScore: ((Number(bo.amount)||0) > 0 || (Number(ord.revenue)||0) > 0)
-        ? (Number(bo.amount)||0) : -1,
-    };
-  });
+    const returnsIcon = retQty > YEST_RETURNS_WARN_GT ? '❗' : '▫️';
+    const brakIcon    = brakQty > YEST_BRAK_WARN_GT    ? '❗' : '▫️';
+    const stockIcon   = stock  < YEST_STOCK_WARN_LT    ? '❗' : '▫️';
+    const drrIcon     = (drr != null && drr > MTD_DRR_WARN_GT) ? '❗' : '▫️';
 
-  rows.sort((a, b) => {
-    if (a.activeScore !== b.activeScore) return b.activeScore - a.activeScore;
-    return a.sku - b.sku;
-  });
+    const qtyMoney = (qty, sum) => Number(qty)
+      ? `${Math.round(qty).toLocaleString('ru-RU')} шт. на ${formatMoney(sum)}₽`
+      : 'нет';
+    const qtyOnly = (qty) => Number(qty)
+      ? `${Math.round(qty).toLocaleString('ru-RU')} шт.`
+      : 'нет';
 
-  // 6) Рендер
-  const out = [];
-  rows.forEach((r) => {
-    out.push('<code> - - - - </code>');
-    out.push(`<code>🔹 ${esc(r.name)} (${r.sku})</code>`);
-    out.push(`<code>📦 Заказано: ${r.orderedQty.toLocaleString('ru-RU')} шт.</code>`);
-    out.push(`<code>💸 Заказано на сумму: ${formatMoney(r.orderedSum)}₽</code>`);
-    out.push(`<code>📦 Выкуплено: ${r.buyoutQty.toLocaleString('ru-RU')} шт.</code>`);
-    out.push(`<code>💸 Выкуплено на сумму: ${formatMoney(r.buyoutSum)}₽</code>`);
-    out.push(`<code>📦 Остаток на складе: ${r.stock.toLocaleString('ru-RU')} шт.</code>`);
-  });
+    lines.push(`<code>📦 ${esc(displayName)} (${sku})</code>`);
+    lines.push(`<code>▫️ Заказано: ${qtyMoney(ord.ordered, ord.revenue)}</code>`);
+    lines.push(`<code>▫️ Выкуплено: ${qtyMoney(bo.count, bo.amount)}</code>`);
+    lines.push(`<code>${returnsIcon} Возвраты: ${qtyOnly(retQty)}</code>`);
+    lines.push(`<code>${brakIcon} Брак (в возвратах): ${brakQty ? `${brakQty.toLocaleString('ru-RU')} шт.` : 'нет'}</code>`);
+    lines.push(`<code>${stockIcon} Остаток на складе: ${qtyOnly(stock)}</code>`);
+    lines.push(`<code>${drrIcon} Д.Р.Р.: ${drr == null ? '—' : format2(drr) + '%'}</code>`);
+    lines.push(''); // пустая строка как в примере
+    lines.push('<code> - - - - </code>');
+  }
 
-  return out.join('\n');
+  return lines.join('\n');
 }
 
-
-// Сервисные «сегодня/вчера»
+// ------------------------- Сервисные «сегодня/вчера» (как было) -------------------------
 async function makeTodayReportText(user, opts = {}) {
   const date = getTodayISO();
   return makeReportText(user, date, { ...(opts || {}), hideAds: true });
