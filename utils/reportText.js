@@ -14,17 +14,21 @@ const {
 const { ozonApiRequest } = require('../services/ozon/api');
 const { getPerSkuStatsFromDaily, getCampaignDailyStatsTotals } = require('../services/performanceApi');
 const { getTodayISO, getYesterdayISO } = require('./utils');
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ---------- ENV пороги для второго сообщения ----------
+// ---------- ENV пороги ----------
 const YEST_RETURNS_WARN_GT = Number(process.env.YEST_RETURNS_WARN_GT ?? 0); // Возвраты > → ❗
 const YEST_BRAK_WARN_GT    = Number(process.env.YEST_BRAK_WARN_GT ?? 0);    // Брак > → ❗
 const YEST_STOCK_WARN_LT   = Number(process.env.YEST_STOCK_WARN_LT ?? 10);  // Остаток < → ❗
-const MTD_DRR_WARN_GT      = Number(process.env.MTD_DRR_WARN_GT ?? 10);     // Д.Р.Р. > → ❗
+const MTD_DRR_WARN_GT      = Number(process.env.MTD_DRR_WARN_GT ?? 10);     // Д.Р.Р. > → ❗ (и 🔺 в первом сообщении)
+const MTD_CTR_WARN_LT      = Number(process.env.MTD_CTR_WARN_LT ?? 2.5);    // CTR < → 🔻
+
+const YEST_SOINVEST_WARN_LT = Number(process.env.YEST_SOINVEST_WARN_LT ?? 10); // Соинвест < → 🔺
+const YEST_SVD_WARN_GT      = Number(process.env.YEST_SVD_WARN_GT ?? 29);      // СВД > → 🔺
 
 // --------------------------------- Вспомогательные ---------------------------------
 async function getOrderedBySkuMapSafe({ client_id, api_key, date, trackedSkus }) {
-  // безопасные ретраи при rate-limit (code:8 / HTTP 429 / 5xx)
   const MAX_RETRIES = 5;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -35,19 +39,17 @@ async function getOrderedBySkuMapSafe({ client_id, api_key, date, trackedSkus })
       const msg  = String(e?.response?.data?.message || e?.message || '').toLowerCase();
       const isRate = http === 429 || code === 8 || msg.includes('rate limit');
       const is5xx  = http >= 500 && http < 600;
-      if (!isRate && !is5xx) throw e; // не ретраим нефлэткие ошибки
+      if (!isRate && !is5xx) throw e;
       if (attempt >= MAX_RETRIES) throw e;
-      // экспоненциальный бэкофф с джиттером
-      const base = 300 * Math.pow(2, attempt); // 300,600,1200,2400,4800
+      const base = 300 * Math.pow(2, attempt);
       const jitter = Math.floor(Math.random() * 200);
       const ms = Math.min(5000, base + jitter);
       await sleep(ms);
     }
   }
-  return new Map(); // теоретически недостижимо
+  return new Map();
 }
 
-// маленький чанкёр на всякий случай для /v1/analytics/stocks
 async function getStocksSumBySkusChunked({ client_id, api_key, skus, chunk = 900 }) {
   if (!Array.isArray(skus) || !skus.length) return new Map();
   const out = new Map();
@@ -88,31 +90,116 @@ function esc(s = '') {
     .replace(/>/g, '&gt;');
 }
 
-// Выравнивание по правому краю (для моноширинного текста)
-function padRight(str, width = 8) {
-  const v = String(str);
-  const spaces = Math.max(0, width - v.length);
-  return ' '.repeat(spaces) + v;
-}
-
-// Формат с 2 знаками после запятой
 function format2(num) {
   if (num == null || !isFinite(num)) return '-';
   return Number(num).toLocaleString('ru-RU', {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
-  });
+  }) + '%';
 }
 
-// Первое слово из названия
 function firstWord(s = '') {
   return String(s).trim().split(/\s+/)[0] || '';
 }
 
-// «в названии причины возврата есть "брак"»
 const includesBrak = (s) => typeof s === 'string' && s.toLowerCase().includes('брак');
 
-// --------------------------------- Первое сообщение (без изменений по форме) ---------------------------------
+// --------- API helpers: СВД и Соинвест ---------
+
+// СВД (Среднее Время Доставки): POST /v1/analytics/average-delivery-time
+async function fetchAverageDeliveryTime({ client_id, api_key }) {
+  try {
+    const resp = await ozonApiRequest({
+      client_id, api_key,
+      endpoint: '/v1/analytics/average-delivery-time',
+      body: {
+        delivery_schema: 'ALL',
+        supply_period: 'FOUR_WEEKS',
+      },
+    });
+    const val =
+      Number(resp?.result?.total?.average_delivery_time) ||
+      Number(resp?.total?.average_delivery_time) || null;
+    return Number.isFinite(val) ? Math.round(val) : null; // отображаем целым числом часов
+  } catch (e) {
+    console.error('[fetchAverageDeliveryTime] error:', e?.response?.data || e.message);
+    return null;
+  }
+}
+
+// Соинвест (средний % по отслеживаемым): v4 stocks -> v5 prices
+async function fetchSoinvestAvg({ client_id, api_key, trackedSkus }) {
+  if (!Array.isArray(trackedSkus) || !trackedSkus.length) return null;
+  const trackedSet = new Set(trackedSkus.map(Number).filter(Number.isFinite));
+
+  // 1) sku -> product_id
+  const skuToPid = new Map();
+  let cursor = '';
+  for (let i = 0; i < 50; i++) {
+    const resp = await ozonApiRequest({
+      client_id, api_key,
+      endpoint: '/v4/product/info/stocks',
+      body: {
+        cursor,
+        filter: { visibility: 'ALL' },
+        limit: 100,
+      },
+    });
+    const items = resp?.result?.items || resp?.items || [];
+    for (const it of items) {
+      const pid = Number(it?.product_id || it?.id || 0);
+      const stocks = Array.isArray(it?.stocks) ? it.stocks : [];
+      for (const st of stocks) {
+        const sku = Number(st?.sku || 0);
+        if (Number.isFinite(sku) && trackedSet.has(sku) && Number.isFinite(pid)) {
+          skuToPid.set(sku, pid);
+        }
+      }
+    }
+    const nextCursor = resp?.result?.cursor ?? resp?.cursor ?? '';
+    cursor = typeof nextCursor === 'string' ? nextCursor : '';
+    if (!cursor) break;
+    if (skuToPid.size >= trackedSet.size) break;
+  }
+
+  const productIds = Array.from(new Set([...skuToPid.values()])).filter(Number.isFinite);
+  if (!productIds.length) return null;
+
+  // 2) prices по product_id (чанками)
+  const pcts = [];
+  for (let i = 0; i < productIds.length; i += 100) {
+    const part = productIds.slice(i, i + 100).map(String);
+    let next = '';
+    for (let page = 0; page < 20; page++) {
+      const resp = await ozonApiRequest({
+        client_id, api_key,
+        endpoint: '/v5/product/info/prices',
+        body: {
+          cursor: next,
+          filter: { product_id: part, visibility: 'ALL' },
+          limit: 100,
+        },
+      });
+      const items = resp?.result?.items || resp?.items || [];
+      for (const it of items) {
+        const mp  = Number(it?.price?.marketing_price ?? 0);
+        const msp = Number(it?.price?.marketing_seller_price ?? 0);
+        if (msp > 0 && mp > 0 && mp <= msp) {
+          const pct = (1 - mp / msp) * 100;
+          if (Number.isFinite(pct)) pcts.push(pct);
+        }
+      }
+      next = resp?.result?.cursor ?? resp?.cursor ?? '';
+      if (!next) break;
+    }
+  }
+
+  if (!pcts.length) return null;
+  const avg = pcts.reduce((a, b) => a + b, 0) / pcts.length;
+  return Math.round(avg);
+}
+
+// --------------------------------- Первое сообщение ---------------------------------
 async function makeReportText(user, date, opts = {}) {
   const from = `${date}T00:00:00.000Z`;
   const to   = `${date}T23:59:59.999Z`;
@@ -168,7 +255,7 @@ async function makeReportText(user, date, opts = {}) {
     buyoutAmount: stats.totalAmount,
   });
 
-  // --- реклама Performance (итоги за день) ---
+  // --- реклама Performance (итоги за день для CTR/ДРР) ---
   let adSpendPerf = null, ctrPerf = null, drrPerf = null;
   if (!hideAds) {
     try {
@@ -204,36 +291,64 @@ async function makeReportText(user, date, opts = {}) {
     }
   }
 
-  // Формируем строки
+  // --- СВД и Соинвест ---
+  const svdAvg = await fetchAverageDeliveryTime({
+    client_id: user.client_id,
+    api_key:   user.seller_api,
+  });
+
+  let soinvestAvg = null;
+  try {
+    if (Array.isArray(trackedSkus) && trackedSkus.length) {
+      soinvestAvg = await fetchSoinvestAvg({
+        client_id: user.client_id,
+        api_key:   user.seller_api,
+        trackedSkus,
+      });
+    }
+  } catch (e) {
+    console.error('[makeReportText] soinvest error:', e?.response?.data || e.message);
+  }
+
+  // Иконки по порогам
+  const drrIcon = (drrPerf != null && drrPerf > MTD_DRR_WARN_GT) ? '🔺' : '▫️';
+  const ctrIcon = (ctrPerf != null && ctrPerf < MTD_CTR_WARN_LT) ? '🔻' : '▫️';
+  const svdIcon = (svdAvg  != null && svdAvg  > YEST_SVD_WARN_GT) ? '🔺' : '▫️';
+  const soiIcon = (soinvestAvg != null && soinvestAvg < YEST_SOINVEST_WARN_LT) ? '🔺' : '▫️';
+
+  // -------- Формирование строк по новому формату --------
   const lines = [];
-  lines.push(`🏪 Магазин:  ${padRight(user.shop_name || 'Неизвестно', 0)}`);
+  lines.push(`🏪 Магазин: ${user.shop_name || 'Неизвестно'}`);
   lines.push(' - - - - ');
-  lines.push(`📆 Отчёт за:  ${padRight(date, 0)}`);
+  lines.push(`📆 Общий отчёт за: ${date}`);
   lines.push(' - - - - ');
-  lines.push(`📦 Заказано товаров:  ${padRight(orderedUnits, 2)} шт.`);
-  lines.push(`💸 Заказано на сумму:  ${padRight(`${formatMoney(revenueOrdered)}₽`, 2)}`);
+  lines.push(`📦 Заказы: ${Math.round(orderedUnits).toLocaleString('ru-RU')} шт. на ${formatMoney(revenueOrdered)}₽`);
   lines.push(' - - - - ');
-  lines.push(`📦 Выкуплено товаров:  ${padRight(stats.totalCount, 2)} шт.`);
-  lines.push(`💸 Выкуплено на сумму:  ${padRight(`${formatMoney(buyoutAmount)}₽`, 2)}`);
-  lines.push(`💸 Себестоимость выкупов:  ${padRight(`${formatMoney(stats.buyoutCost)}₽`, 2)}`);
+  lines.push(`📦 Выкуплено: ${Math.round(stats.totalCount).toLocaleString('ru-RU')} шт. на ${formatMoney(buyoutAmount)}₽`);
   lines.push(' - - - - ');
-  lines.push(`📦 Возвраты:  ${padRight(returnsCount, 2)} шт.`);
-  lines.push(`💸 Возвраты на сумму:  ${padRight(`${formatMoney(returnsSum)}₽`, 2)}`);
+  lines.push(`📦 Возвраты: ${Math.round(returnsCount).toLocaleString('ru-RU')} шт. на ${formatMoney(returnsSum)}₽`);
   lines.push(' - - - - ');
 
   if (!hideAds) {
     const adSpendLine = adSpendPerf == null ? '-' : `${formatMoney(adSpendPerf)}₽`;
-    const drrLine     = drrPerf == null     ? '-' : `${format2(drrPerf)}%`;
-    const ctrLine     = ctrPerf == null     ? '-' : `${format2(ctrPerf)}%`;
-    lines.push(`💸 Расходы на рекламу:  ${padRight(adSpendLine, 2)}`);
-    lines.push(`💸 Д.Р.Р:  ${padRight(drrLine, 2)}`);
-    lines.push(`💸 CTR:  ${padRight(ctrLine, 2)}`);
+    const drrLine     = drrPerf == null     ? '-' : format2(drrPerf);
+    const ctrLine     = ctrPerf == null     ? '-' : format2(ctrPerf);
+    const svdLine     = svdAvg == null      ? '-' : `${svdAvg} ч.`;   // ч. — как просили
+    const soiLine     = soinvestAvg == null ? '-' : `${soinvestAvg}%`;
+
+    lines.push(`▫️ Расходы на рекламу:  ${adSpendLine}`);
+    lines.push(`${drrIcon} Д.Р.Р:  ${drrLine}`);
+    lines.push(`${ctrIcon} CTR:  ${ctrLine}`);
+    lines.push(`${soiIcon} Соинвест: ${soiLine}`);
+    lines.push(`${svdIcon} СВД: ${svdLine}`);
     lines.push(' - - - - ');
-    lines.push(`💰 Прибыль:  ${padRight(`${formatMoney(profit)}₽`, 2)}`);
+    lines.push(`💰 Прибыль: ${formatMoney(profit)}₽`);
+    lines.push(' - - - - ');
+  } else {
+    lines.push(`💰 Прибыль: ${formatMoney(profit)}₽`);
     lines.push(' - - - - ');
   }
 
-  // ВОЗВРАЩАЕМ моноширинный БЕЗ подложки (каждая строка в <code>)
   return lines.map(line => `<code>${esc(line)}</code>`).join('\n');
 }
 
@@ -241,35 +356,53 @@ async function makeReportText(user, date, opts = {}) {
 async function getReturnsBySkuForDate({ client_id, api_key, date }) {
   const fromISO = `${date}T00:00:00.000Z`;
   const toISO   = `${date}T23:59:59.999Z`;
+
   const limit = 500;
   let last_id = 0;
-  const counts = new Map();     // sku -> qty
-  const brakCounts = new Map(); // sku -> qty
-  const seen = new Set();
+
+  const counts    = new Map(); // sku -> qty
+  const brakCounts= new Map(); // sku -> qty
+  const seen      = new Set();
 
   while (true) {
     const resp = await ozonApiRequest({
       client_id, api_key,
       endpoint: '/v1/returns/list',
-      body: { filter: { logistic_return_date: { time_from: fromISO, time_to: toISO } }, limit, last_id },
+      body: {
+        filter: { logistic_return_date: { time_from: fromISO, time_to: toISO } },
+        limit,
+        last_id
+      },
     });
-    const items = resp?.result?.returns || [];
-    if (!items.length) break;
+
+    // <- ВАЖНО: у Ozon данные могут быть как в resp.result.*, так и на корне
+    const result = resp?.result ?? resp ?? {};
+    const items  = Array.isArray(result.returns) ? result.returns : [];
+
+    if (!items.length) {
+      // если нет элементов и нет has_next — выходим
+      if (!result.has_next) break;
+    }
 
     for (const it of items) {
-      const sku = Number(it?.sku ?? it?.product?.sku ?? it?.product_id?.sku ?? 0);
+      // sku в ответе находится в product.sku
+      const sku = Number(it?.product?.sku ?? it?.sku ?? 0);
       if (!Number.isFinite(sku)) continue;
 
+      // дедуп по id (или fallback по posting_number+sku+index)
       const id  = it?.id ?? it?.return_id ?? it?.acceptance_id ?? null;
       const pn  = it?.posting_number || it?.posting?.posting_number || '';
       const idx = it?.item_index ?? it?.item_id ?? it?.index ?? 0;
       const key = id != null ? `id:${id}` : `pn:${pn}|sku:${sku}|idx:${idx}`;
-      if (seen.has(key)) continue; seen.add(key);
+      if (seen.has(key)) continue;
+      seen.add(key);
 
-      const q = Number.isFinite(Number(it?.quantity))
-        ? Number(it?.quantity)
-        : Number.isFinite(Number(it?.return_count)) ? Number(it?.return_count)
-        : Number.isFinite(Number(it?.qty)) ? Number(it?.qty)
+      // количество — корректно берём из product.quantity, иначе фолбэки
+      const q = Number.isFinite(Number(it?.product?.quantity))
+        ? Number(it.product.quantity)
+        : Number.isFinite(Number(it?.quantity))      ? Number(it.quantity)
+        : Number.isFinite(Number(it?.return_count))  ? Number(it.return_count)
+        : Number.isFinite(Number(it?.qty))           ? Number(it.qty)
         : 1;
 
       counts.set(sku, (counts.get(sku) || 0) + q);
@@ -280,50 +413,96 @@ async function getReturnsBySkuForDate({ client_id, api_key, date }) {
       }
     }
 
-    const next = Number(resp?.result?.last_id ?? 0);
-    if (!next || next === last_id) break;
-    last_id = next;
+    // пагинация: has_next / last_id могут быть как в result, так и на корне
+    const hasNext = Boolean(result.has_next);
+    if (!hasNext) break;
+
+    const nextLastId = Number(result.last_id ?? (items.length ? items[items.length - 1].id : 0));
+    if (!nextLastId || nextLastId === last_id) break;
+    last_id = nextLastId;
   }
 
   return { counts, brakCounts };
 }
 
-// --------------------------------- Второе сообщение (обновлённый формат) ---------------------------------
-/**
- * Второе сообщение: разбивка по позициям ЗА ВЧЕРА.
- * Формат по требованиям:
- * 📆 Отчёт за:  YYYY-MM-DD
- * 📦 Название (sku)
- * ▫️ Заказано: N шт. на S₽
- * ▫️ Выкуплено: N шт. на S₽
- * ▫️ Возвраты: N шт.   (❗ если > YEST_RETURNS_WARN_GT)
- * ▫️ Брак (в возвратах): N шт. (❗ если > YEST_BRAK_WARN_GT)
- * ▫️ Остаток на складе: N шт.  (❗ если < YEST_STOCK_WARN_LT)
- * ▫️/❗ Д.Р.Р.: X,XX%   (❗ если > MTD_DRR_WARN_GT)
- *  - - - - 
- */
+// Fallback/дополнение: возвраты из финопераций с items (accruals_for_sale < 0)
+async function getFinanceReturnsBySkuForDate({ client_id, api_key, date }) {
+  const fromISO = `${date}T00:00:00.000Z`;
+  const toISO   = `${date}T23:59:59.999Z`;
+  const page_size = 1000;
+  let page = 1;
+  const counts = new Map();
+
+  while (true) {
+    const resp = await ozonApiRequest({
+      client_id, api_key,
+      endpoint: '/v3/finance/transaction/list',
+      body: {
+        filter: {
+          date: { from: fromISO, to: toISO },
+          operation_type: [],
+          posting_number: '',
+          transaction_type: 'all',
+        },
+        page,
+        page_size,
+      },
+    });
+    const ops = Array.isArray(resp?.result?.operations) ? resp.result.operations : [];
+    if (!ops.length) break;
+
+    for (const op of ops) {
+      const items = Array.isArray(op?.items) ? op.items : [];
+      if (!items.length) continue;
+      const accr = Number(op?.accruals_for_sale || 0);
+      if (accr >= 0) continue; // интересуют только «минус продажи» (возвраты/отмены с items)
+
+      for (const it of items) {
+        const sku = Number(it?.sku || 0);
+        const qty = Number(it?.quantity || 0) || 1;
+        if (!Number.isFinite(sku)) continue;
+        counts.set(sku, (counts.get(sku) || 0) + qty);
+      }
+    }
+
+    if (resp?.result?.has_next === true) {
+      page += 1;
+    } else break;
+  }
+
+  return counts;
+}
+
+function mergeReturnsMax(primaryMap, secondaryMap) {
+  // объединяем по максимуму, чтобы не задвоить при совпадении из двух источников
+  const out = new Map(primaryMap);
+  for (const [sku, qty] of secondaryMap.entries()) {
+    const cur = Number(out.get(sku) || 0);
+    if (qty > cur) out.set(sku, qty);
+  }
+  return out;
+}
+
+// --------------------------------- Второе сообщение ---------------------------------
 async function makeSkuBreakdownText(user, date, opts = {}) {
   const from = `${date}T00:00:00.000Z`;
   const to   = `${date}T23:59:59.999Z`;
 
-  // 0) Базовый список SKU — показываем все отслеживаемые
+  // 0) Базовый список SKU — можно ограничить отслеживаемыми
   const trackedSkus = Array.isArray(opts.trackedSkus) && opts.trackedSkus.length
     ? [...new Set(opts.trackedSkus.map(Number).filter(Number.isFinite))]
     : null;
 
-  // 0.1) Карта названий из БД, чтобы корректно именовать SKU без выкупов
+  // 0.1) Названия из БД
   let titleMap = new Map();
   if (opts.db && opts.chatId) {
     try {
-      const r = await opts.db.query(
-        `
+      const r = await opts.db.query(`
         SELECT sp.sku::bigint AS sku, COALESCE(sp.title, '') AS title
         FROM shop_products sp
         JOIN shops s ON s.id = sp.shop_id
         WHERE s.chat_id = $1
-        `,
-        [opts.chatId]
-      );
+      `, [opts.chatId]);
       for (const row of (r.rows || [])) {
         const skuNum = Number(row.sku);
         if (Number.isFinite(skuNum)) titleMap.set(skuNum, row.title || '');
@@ -361,20 +540,36 @@ async function makeSkuBreakdownText(user, date, opts = {}) {
     console.error('[makeSkuBreakdownText] ordered map error (after retries):', e?.response?.data || e.message);
   }
 
-  // 3) Итоговый набор SKU для вывода
+  // 3) Возвраты/брак за день по SKU — сначала из returns/list
+  let { counts: returnsMap, brakCounts: brakMap } = await getReturnsBySkuForDate({
+    client_id: user.client_id,
+    api_key:   user.seller_api,
+    date,
+  });
+
+  // 3.1) Дополняем/страхуем возвратами из финопераций (min- продажи с items)
+  try {
+    const finReturns = await getFinanceReturnsBySkuForDate({ client_id: user.client_id, api_key: user.seller_api, date });
+    returnsMap = mergeReturnsMax(returnsMap, finReturns);
+  } catch (e) {
+    console.warn('[makeSkuBreakdownText] finance returns fallback error:', e?.response?.data || e.message);
+  }
+
+  // 4) Итоговый набор SKU — объединяем заказы, выкупы и возвраты
   let finalSkus;
   if (trackedSkus && trackedSkus.length) {
     finalSkus = trackedSkus;
   } else {
     const set = new Set([
-      ...Array.from(buyoutBySku.keys()),
       ...Array.from(orderedMap.keys()),
+      ...Array.from(buyoutBySku.keys()),
+      ...Array.from(returnsMap.keys()),
     ]);
     finalSkus = Array.from(set.values());
   }
   if (!finalSkus.length) return '<code>Данных по позициям нет.</code>';
 
-  // 4) Остатки — батчами
+  // 5) Остатки — по финальному набору
   let stockMap = new Map();
   try {
     stockMap = await getStocksSumBySkusChunked({
@@ -385,13 +580,6 @@ async function makeSkuBreakdownText(user, date, opts = {}) {
   } catch (e) {
     console.error('[makeSkuBreakdownText] stocks error:', e?.response?.data || e.message);
   }
-
-  // 5) Возвраты/брак за день по SKU
-  const { counts: returnsMap, brakCounts: brakMap } = await getReturnsBySkuForDate({
-    client_id: user.client_id,
-    api_key:   user.seller_api,
-    date,
-  });
 
   // 6) Д.Р.Р. за день по SKU через Performance API
   let drrBySku = new Map();
@@ -410,7 +598,6 @@ async function makeSkuBreakdownText(user, date, opts = {}) {
       if (rr.rowCount) {
         const perfId     = rr.rows[0].performance_client_id;
         const perfSecret = rr.rows[0].performance_secret;
-        // веса для «все товары» — пропорционально выручке за день
         const allocationWeights = {};
         for (const sku of finalSkus) {
           allocationWeights[sku] = Number(orderedMap.get(sku)?.revenue || 0);
@@ -439,10 +626,9 @@ async function makeSkuBreakdownText(user, date, opts = {}) {
 
   // 7) Рендер
   const lines = [];
-  lines.push(`<code>📆 Отчёт за:  ${esc(date)}</code>`);
+  lines.push(`<code>📆 Отчёт по товарам за: ${esc(date)}</code>`);
   lines.push('<code> - - - - </code>');
 
-  // Сортировка: по выручке за день
   const orderedSkus = [...new Set(finalSkus)].sort((a,b) => {
     const ra = Number(orderedMap.get(a)?.revenue || 0);
     const rb = Number(orderedMap.get(b)?.revenue || 0);
@@ -457,7 +643,6 @@ async function makeSkuBreakdownText(user, date, opts = {}) {
     const brakQty = Number(brakMap.get(sku) || 0);
     const drr = drrBySku.has(sku) ? drrBySku.get(sku) : null;
 
-    // имя: приоритет DB -> из выкупов -> SKU N
     const titleFromDb  = titleMap.get(sku) || '';
     const titleFromOps = bo.name || '';
     const displayName  = firstWord(titleFromDb || titleFromOps) || `SKU ${sku}`;
@@ -480,15 +665,14 @@ async function makeSkuBreakdownText(user, date, opts = {}) {
     lines.push(`<code>${returnsIcon} Возвраты: ${qtyOnly(retQty)}</code>`);
     lines.push(`<code>${brakIcon} Брак (в возвратах): ${brakQty ? `${brakQty.toLocaleString('ru-RU')} шт.` : 'нет'}</code>`);
     lines.push(`<code>${stockIcon} Остаток на складе: ${qtyOnly(stock)}</code>`);
-    lines.push(`<code>${drrIcon} Д.Р.Р.: ${drr == null ? '—' : format2(drr) + '%'}</code>`);
-    lines.push(''); // пустая строка как в примере
+    lines.push(`<code>${drrIcon} Д.Р.Р.: ${drr == null ? '—' : format2(drr)}</code>`);
     lines.push('<code> - - - - </code>');
   }
 
   return lines.join('\n');
 }
 
-// ------------------------- Сервисные «сегодня/вчера» (как было) -------------------------
+// ------------------------- Сервисные «сегодня/вчера» -------------------------
 async function makeTodayReportText(user, opts = {}) {
   const date = getTodayISO();
   return makeReportText(user, date, { ...(opts || {}), hideAds: true });

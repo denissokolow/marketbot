@@ -2,12 +2,12 @@
 // MTD-отчёт по SKU. Учитываем ТОЛЬКО финоперации, где есть items (операции без items ПРОПУСКАЕМ).
 // Выводим: Заказано / Выкуплено / Доставляется / Возвраты / Брак / % выкупа / Д.Р.Р / CTR / Расходы / Прибыль(после рекламы) / Прибыль на шт. / ROI.
 // Пороговые иконки (ENV):
-//   MTD_PICKUP_WARN_LT        (default 80)   — если % выкупа ниже → 🔻 (иначе ▫️)
-//   MTD_DRR_WARN_GT           (default 10)   — если Д.Р.Р выше   → 🔺 (иначе ▫️)
-//   MTD_CTR_WARN_LT           (default 2.5)  — если CTR ниже     → 🔻 (иначе ▫️)
-//   MTD_ROI_WARN_LT           (default 15)   — если ROI ниже     → 🔻 (иначе ▫️)
-//   MTD_PROFIT_WARN_LT        (default 0)    — если прибыль <    → 🔻 (иначе ▫️)
-//   MTD_PROFIT_PER_UNIT_WARN_LT (default 100)— если прибыль/шт < → 🔻 (иначе ▫️)
+//   MTD_PICKUP_WARN_LT          (default 80)   — если % выкупа ниже → 🔻 (иначе ▫️)
+//   MTD_DRR_WARN_GT             (default 10)   — если Д.Р.Р выше   → 🔺 (иначе ▫️)
+//   MTD_CTR_WARN_LT             (default 2.5)  — если CTR ниже     → 🔻 (иначе ▫️)
+//   MTD_ROI_WARN_LT             (default 15)   — если ROI ниже     → 🔻 (иначе ▫️)
+//   MTD_PROFIT_WARN_LT          (default 0)    — если прибыль <    → 🔻 (иначе ▫️)
+//   MTD_PROFIT_PER_UNIT_WARN_LT (default 100)  — если прибыль/шт < → 🔻 (иначе ▫️)
 
 const { ozonApiRequest } = require('../services/ozon/api');
 const { getTodayISO, getYesterdayISO } = require('./utils');
@@ -29,12 +29,12 @@ const OZON_MAX_RETRIES     = Number(process.env.OZON_MAX_RETRIES || 5);
 const OZON_BACKOFF_BASE_MS = Number(process.env.OZON_BACKOFF_BASE_MS || 300);
 
 // Пороговые значения (ENV)
-const MTD_PICKUP_WARN_LT         = Number(process.env.MTD_PICKUP_WARN_LT ?? 80);
-const MTD_DRR_WARN_GT            = Number(process.env.MTD_DRR_WARN_GT ?? 10);
-const MTD_CTR_WARN_LT            = Number(process.env.MTD_CTR_WARN_LT ?? 2.5);
-const MTD_ROI_WARN_LT            = Number(process.env.MTD_ROI_WARN_LT ?? 15);
-const MTD_PROFIT_WARN_LT         = Number(process.env.MTD_PROFIT_WARN_LT ?? 0);
-const MTD_PROFIT_PER_UNIT_WARN_LT= Number(process.env.MTD_PROFIT_PER_UNIT_WARN_LT ?? 100);
+const MTD_PICKUP_WARN_LT           = Number(process.env.MTD_PICKUP_WARN_LT ?? 80);
+const MTD_DRR_WARN_GT              = Number(process.env.MTD_DRR_WARN_GT ?? 10);
+const MTD_CTR_WARN_LT              = Number(process.env.MTD_CTR_WARN_LT ?? 2.5);
+const MTD_ROI_WARN_LT              = Number(process.env.MTD_ROI_WARN_LT ?? 15);
+const MTD_PROFIT_WARN_LT           = Number(process.env.MTD_PROFIT_WARN_LT ?? 0);
+const MTD_PROFIT_PER_UNIT_WARN_LT  = Number(process.env.MTD_PROFIT_PER_UNIT_WARN_LT ?? 100);
 
 // ---------- период: MTD (с начала месяца по конец вчера) ----------
 function getMtdRange() {
@@ -526,14 +526,13 @@ async function makeMtdPerSkuText(user, { trackedSkus = [], db = null, chatId = n
     const ctrIcon    = (ctr != null && ctr < MTD_CTR_WARN_LT) ? '🔻' : '▫️';
     const profitIcon = (Number.isFinite(profitAfterAds) && profitAfterAds < MTD_PROFIT_WARN_LT) ? '🔻' : '▫️';
 
-    // ROI = (ПрибыльПослеРекламы) / (Себестоимость + Площадочные + Реклама) × 100%
-    const invest = costTotal + expenses + adSpend;
+    // >>>>>>> ИЗМЕНЕНО: ROI = (Прибыль после рекламы / Себестоимость) × 100
     let roi = null;
-    if (invest > 0 && Number.isFinite(profitAfterAds)) {
-      roi = (profitAfterAds / invest) * 100;
-    }
-    const roiStr  = fmtPct2(roi);
-    const roiIcon = (roi != null && roi < MTD_ROI_WARN_LT) ? '🔻' : '▫️';
+if (costTotal > 0 && Number.isFinite(profitAfterAds)) {
+  roi = ((profitAfterAds + costTotal) / costTotal) * 100;
+}
+const roiStr  = fmtPct2(roi);
+const roiIcon = (roi != null && roi < MTD_ROI_WARN_LT) ? '🔻' : '▫️';
 
     // Прибыль на шт. (по выкупленным)
     const profitPerUnit = netCnt > 0 && Number.isFinite(profitAfterAds)
@@ -555,8 +554,7 @@ async function makeMtdPerSkuText(user, { trackedSkus = [], db = null, chatId = n
   profit (before ads):    ${m(profitBeforeAds)}      (= grossRev - expenses - costTotal)
   adSpend:                ${m(adSpend)}
   profit (after ads):     ${m(profitAfterAds)}       (= profitBeforeAds - adSpend)
-  invest:                 ${m(invest)}      (= costTotal + expenses + adSpend)
-  ROI:                    ${roiStr}
+ROI ((profit+cost)/cost): ${roiStr}
   profit per unit:        ${ppuStr}`);
     }
 
@@ -593,14 +591,14 @@ async function makeMtdPerSkuText(user, { trackedSkus = [], db = null, chatId = n
   Брак (reason):   ${brakQty}
   Процент выкупа:  ${pickupPercentStr}
   CTR/ДРР:         ${ctrStr} / ${drrStr}
-  ROI:             ${roiStr}
+  ROI ((profit+cost)/cost): ${roiStr}
   Прибыль/шт:      ${ppuStr}
   ⇒ Прибыль (после рекламы): ${fmtMoney0(profitAfterAds)} ₽`);
     }
   }
 
   // итог по прибыли — СУММА ПОСЛЕ РЕКЛАМЫ
-  lines.push(`<code>▪️ Общая прибыль: ${fmtMoney0(totalProfitAfterAds)}₽</code>`);
+  lines.push(`<code>💰 Общая прибыль: ${fmtMoney0(totalProfitAfterAds)}₽</code>`);
   return lines.join('\n');
 }
 
