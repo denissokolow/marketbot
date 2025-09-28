@@ -52,6 +52,45 @@ function getMtdRange() {
   };
 }
 
+// ---------- ABC (по прибыли ПОСЛЕ рекламы) ----------
+function computeAbcByProfit(profitBySkuMap) {
+  const arr = [];
+  let totalPositive = 0;
+  profitBySkuMap.forEach((profit, sku) => {
+    const p = Number(profit) || 0;
+    arr.push({ sku, profit: p });
+    if (p > 0) totalPositive += p;
+  });
+  if (totalPositive <= 0) {
+    const out = new Map();
+    profitBySkuMap.forEach((_, sku) => out.set(sku, 'C'));
+    return out;
+  }
+  arr.sort((a, b) => b.profit - a.profit);
+
+  const ABC_A_LIMIT = Number(process.env.ABC_A_LIMIT ?? 0.80);
+  const ABC_B_LIMIT = Number(process.env.ABC_B_LIMIT ?? 0.95);
+
+  const out = new Map();
+  let cum = 0;
+  for (const { sku, profit } of arr) {
+    if (profit <= 0) { out.set(sku, 'C'); continue; }
+    cum += profit;
+    const share = cum / totalPositive;
+    if (share <= ABC_A_LIMIT) out.set(sku, 'A');
+    else if (share <= ABC_B_LIMIT) out.set(sku, 'B');
+    else out.set(sku, 'C');
+  }
+  return out;
+}
+
+function abcBadge(cls) {
+  // оформление по требованию
+  if (cls === 'A') return '▫️ ABC: A';
+  if (cls === 'B') return '▫️ ABC: B';
+  return '❗ ABC: C';
+}
+
 // ---------- период: произвольные N дней, по вчерашнюю дату ----------
 function getLastNDaysRange(n = 30) {
   const ymdTo = getYesterdayISO(); // YYYY-MM-DD
@@ -468,12 +507,10 @@ async function makeMtdPerSkuText(user, { trackedSkus = [], db = null, chatId = n
     }
   }
 
-  // ---------- вывод ----------
-  const lines = [];
-  lines.push(`<code>🏪 Магазин: ${esc(user.shop_name || 'Неизвестно')}</code>`);
-  lines.push('<code> - - - - </code>');
-  lines.push(`<code>📆 Период: ${esc(monthStartYmd)} → ${esc(yesterdayYmd)}</code>`);
-  lines.push('<code> - - - - </code>');
+  // ---------- расчёт метрик по каждому SKU (1-й проход) ----------
+  const profitBySku = new Map();  // для ABC
+  const perSku = new Map();       // для последующего рендера
+  let totalProfitAfterAds = 0;
 
   // сортировка: по брутто-выручке desc, затем по SKU
   const orderSkus = [...tracked].sort((a, b) => {
@@ -482,8 +519,6 @@ async function makeMtdPerSkuText(user, { trackedSkus = [], db = null, chatId = n
     if (rb !== ra) return rb - ra;
     return a - b;
   });
-
-  let totalProfitAfterAds = 0;
 
   for (const sku of orderSkus) {
     const ord = orderedMap.get(sku) || { ordered:0, revenue:0 };
@@ -517,11 +552,12 @@ async function makeMtdPerSkuText(user, { trackedSkus = [], db = null, chatId = n
       drrStr = fmtPct2(drr);
     }
 
-    // Прибыль ПОСЛЕ рекламы
+    // Прибыль ПОСЛЕ рекламы (адресходы вычитаем РОВНО 1 раз здесь)
     const profitBeforeAds = grossRev - expenses - costTotal;
     const profitAfterAds  = profitBeforeAds - adSpend;
 
     totalProfitAfterAds += profitAfterAds;
+    profitBySku.set(sku, profitAfterAds); // ← для ABC
 
     const titleApi = nameBySku.get(sku) || '';
     const display  = firstWord(titleApi) || `SKU ${sku}`;
@@ -546,13 +582,13 @@ async function makeMtdPerSkuText(user, { trackedSkus = [], db = null, chatId = n
     const ctrIcon    = (ctr != null && ctr < MTD_CTR_WARN_LT) ? '🔻' : '▫️';
     const profitIcon = (Number.isFinite(profitAfterAds) && profitAfterAds < MTD_PROFIT_WARN_LT) ? '🔻' : '▫️';
 
-    // >>>>>>> ИЗМЕНЕНО: ROI = (Прибыль после рекламы / Себестоимость) × 100
+    // ROI = (profitAfterAds + costTotal) / costTotal × 100
     let roi = null;
-if (costTotal > 0 && Number.isFinite(profitAfterAds)) {
-  roi = ((profitAfterAds + costTotal) / costTotal) * 100;
-}
-const roiStr  = fmtPct2(roi);
-const roiIcon = (roi != null && roi < MTD_ROI_WARN_LT) ? '🔻' : '▫️';
+    if (costTotal > 0 && Number.isFinite(profitAfterAds)) {
+      roi = ((profitAfterAds + costTotal) / costTotal) * 100;
+    }
+    const roiStr  = fmtPct2(roi);
+    const roiIcon = (roi != null && roi < MTD_ROI_WARN_LT) ? '🔻' : '▫️';
 
     // Прибыль на шт. (по выкупленным)
     const profitPerUnit = netCnt > 0 && Number.isFinite(profitAfterAds)
@@ -561,7 +597,6 @@ const roiIcon = (roi != null && roi < MTD_ROI_WARN_LT) ? '🔻' : '▫️';
     const ppuIcon = (profitPerUnit != null && profitPerUnit < MTD_PROFIT_PER_UNIT_WARN_LT) ? '🔻' : '▫️';
     const ppuStr  = (profitPerUnit != null) ? `${fmtMoney0(profitPerUnit)}₽` : 'нет';
 
-    // DEBUG
     if (DEBUG_MTD) {
       const m = (x) => fmtMoney0(x) + ' ₽';
       console.log(`[MTD:ROI ${sku}] ${display}
@@ -578,43 +613,67 @@ ROI ((profit+cost)/cost): ${roiStr}
   profit per unit:        ${ppuStr}`);
     }
 
-    // формат "нет" при нуле
-    const qtyLine = (n) => Number(n) ? `${Math.round(Number(n)).toLocaleString('ru-RU')} шт.` : 'нет';
-    const qtyMoneyLine = (qty, sum) =>
-      Number(qty) ? `${Math.round(Number(qty)).toLocaleString('ru-RU')} шт. на ${fmtMoney0(sum)}₽` : 'нет';
+    // Сохраняем все для рендера после расчёта ABC
+    perSku.set(sku, {
+      display, ord,
+      inTransitQty, returnsQty, brakQty,
+      ctrStr, drrStr,
+      expenses,
+      profitAfterAds, ppuStr, roiStr,
+      pickupPercentStr,
+      icons: { pickupIcon, drrIcon, ctrIcon, profitIcon, ppuIcon, roiIcon },
+      // для строк с деньгами/количествами:
+      netCnt, grossRev,
+    });
+  }
 
-    // вывод — в заданном порядке; значок позиции — 📦
+  // ---------- ABC (после 1-го прохода, по прибыли) ----------
+  const abcMap = computeAbcByProfit(profitBySku);
+
+  // ---------- вывод (2-й проход) ----------
+  const lines = [];
+  lines.push(`<code>🏪 Магазин: ${esc(user.shop_name || 'Неизвестно')}</code>`);
+  lines.push('<code> - - - - </code>');
+  lines.push(`<code>📆 Период: ${esc(monthStartYmd)} → ${esc(yesterdayYmd)}</code>`);
+  lines.push('<code> - - - - </code>');
+
+  const qtyLine = (n) => Number(n) ? `${Math.round(Number(n)).toLocaleString('ru-RU')} шт.` : 'нет';
+  const qtyMoneyLine = (qty, sum) =>
+    Number(qty) ? `${Math.round(Number(qty)).toLocaleString('ru-RU')} шт. на ${fmtMoney0(sum)}₽` : 'нет';
+
+  for (const sku of orderSkus) {
+    const s = perSku.get(sku);
+    if (!s) continue;
+
+    const {
+      display, ord,
+      inTransitQty, returnsQty, brakQty,
+      ctrStr, drrStr,
+      expenses,
+      profitAfterAds, ppuStr, roiStr,
+      pickupPercentStr,
+      icons,
+      netCnt, grossRev,
+    } = s;
+
+    const abcClass = abcMap.get(sku) || 'C';
+    const abcStr   = abcBadge(abcClass);
+
     lines.push(`<code>📦 ${esc(display)} (${sku})</code>`);
     lines.push(`<code>▫️ Заказано: ${qtyMoneyLine(ord.ordered, ord.revenue)}</code>`);
     lines.push(`<code>▫️ Выкуплено: ${qtyMoneyLine(netCnt, grossRev)}</code>`);
     lines.push(`<code>▫️ Доставляется: ${qtyLine(inTransitQty)}</code>`);
-    lines.push(`<code>▫️ Возвраты: ${returnsQty ? `${returnsQty.toLocaleString('ru-RU')} шт.` : 'нет'}</code>`);
-    lines.push(`<code>▫️ Брак (в возвратах): ${brakQty ? `${brakQty.toLocaleString('ru-RU')} шт.` : 'нет'}</code>`);
-    lines.push(`<code>${pickupIcon} Процент выкупа: ${pickupPercentStr}</code>`);
-    lines.push(`<code>${drrIcon} Д.Р.Р: ${drrStr}</code>`);
-    lines.push(`<code>${ctrIcon} CTR: ${ctrStr}</code>`);
+    lines.push(`<code>▫️ Возвраты: ${qtyLine(returnsQty)}</code>`);
+    lines.push(`<code>▫️ Брак (в возвратах): ${qtyLine(brakQty)}</code>`);
+    lines.push(`<code>${icons.pickupIcon} Процент выкупа: ${pickupPercentStr}</code>`);
+    lines.push(`<code>${icons.drrIcon} Д.Р.Р: ${drrStr}</code>`);
+    lines.push(`<code>${icons.ctrIcon} CTR: ${ctrStr}</code>`);
     lines.push(`<code>▫️ Расходы: ${Number(expenses) ? `${fmtMoney0(expenses)}₽` : 'нет'}</code>`);
-    lines.push(`<code>${profitIcon} Прибыль: ${Number.isFinite(profitAfterAds) ? `${fmtMoney0(profitAfterAds)}₽` : 'нет'}</code>`);
-    lines.push(`<code>${ppuIcon} Прибыль на шт.: ${ppuStr}</code>`);
-    lines.push(`<code>${roiIcon} ROI: ${roiStr}</code>`);
+    lines.push(`<code>${icons.profitIcon} Прибыль: ${Number.isFinite(profitAfterAds) ? `${fmtMoney0(profitAfterAds)}₽` : 'нет'}</code>`);
+    lines.push(`<code>${icons.ppuIcon} Прибыль на шт.: ${ppuStr}</code>`);
+    lines.push(`<code>${icons.roiIcon} ROI: ${roiStr}</code>`);
+    lines.push(`<code>${abcStr}</code>`);
     lines.push('<code> - - - - </code>');
-
-    if (DEBUG_MTD_DETAILS) {
-      console.log(`[MTD:SKU ${sku}] ${display}
-  Заказано:        ${ord.ordered} шт. на ${fmtMoney0(ord.revenue)} ₽
-  Брутто выручка:  ${fmtMoney0(grossRev)} ₽
-  Брутто шт.:      ${Math.round(posCnt)}  | Возвраты шт.: ${Math.round(negCnt)} | Нетто шт.: ${Math.round(netCnt)}
-  Расходы:         ${fmtMoney0(expenses)} ₽
-  Себестоимость:   ${Math.round(netCnt)} × ${fmtMoney0(net)} ₽ = ${fmtMoney0(costTotal)} ₽ (netCnt × unit cost)
-  Доставляется:    ${inTransitQty}
-  Возвраты (v1):   ${returnsQty}
-  Брак (reason):   ${brakQty}
-  Процент выкупа:  ${pickupPercentStr}
-  CTR/ДРР:         ${ctrStr} / ${drrStr}
-  ROI ((profit+cost)/cost): ${roiStr}
-  Прибыль/шт:      ${ppuStr}
-  ⇒ Прибыль (после рекламы): ${fmtMoney0(profitAfterAds)} ₽`);
-    }
   }
 
   // итог по прибыли — СУММА ПОСЛЕ РЕКЛАМЫ
@@ -719,14 +778,25 @@ async function makeLast30PerSkuText(user, { trackedSkus = [], db = null, chatId 
     });
   }
 
-  // 4) возвраты/брак (без «доставляется» для last30)
-  const { counts: returnsMap, brakCounts: brakMap } = await fetchReturnsStats({
+// 4) доставляется + возвраты/брак
+const [inTransitMap, returnsStats] = await Promise.all([
+  fetchFboDeliveringCounts({
     client_id: user.client_id,
     api_key:   user.seller_api,
     fromISO,
     toISO,
     trackedSet,
-  });
+  }),
+  fetchReturnsStats({
+    client_id: user.client_id,
+    api_key:   user.seller_api,
+    fromISO,
+    toISO,
+    trackedSet,
+  }),
+]);
+const returnsMap = returnsStats.counts;
+const brakMap    = returnsStats.brakCounts;
 
   // 5) реклама per-SKU (allocation по grossAccrPos)
   const allocationWeights = {};
@@ -765,13 +835,7 @@ async function makeLast30PerSkuText(user, { trackedSkus = [], db = null, chatId 
     }
   }
 
-  // ---------- вывод ----------
-  const lines = [];
-  lines.push(`<code>🏪 Магазин: ${esc(user.shop_name || 'Неизвестно')}</code>`);
-  lines.push('<code> - - - - </code>');
-  lines.push(`<code>📆 Период: ${esc(periodStartYmd)} → ${esc(periodEndYmd)}</code>`);
-  lines.push('<code> - - - - </code>');
-
+  // ---------- 1-й проход: посчитать прибыль по каждому SKU и подготовить данные для рендера ----------
   // сортировка: по брутто-выручке desc, затем по SKU
   const orderSkus = [...tracked].sort((a, b) => {
     const ra = Number(agg.get(a)?.grossAccrPos || 0);
@@ -780,6 +844,8 @@ async function makeLast30PerSkuText(user, { trackedSkus = [], db = null, chatId 
     return a - b;
   });
 
+  const profitBySku = new Map(); // для ABC
+  const perSku = new Map();      // кэш строк/значений для вывода
   let totalProfitAfterAds = 0;
 
   for (const sku of orderSkus) {
@@ -808,23 +874,12 @@ async function makeLast30PerSkuText(user, { trackedSkus = [], db = null, chatId 
       drrStr = fmtPct2(drr);
     }
 
-    // ПРИБЫЛЬ — как в MTD-версии файла
+    // ПРИБЫЛЬ — как в MTD
     const profitBeforeAds = grossRev - expenses - costTotal;
     const profitAfterAds  = profitBeforeAds - adSpend;
-    totalProfitAfterAds  += profitAfterAds;
 
-    // ROI и прибыль/шт.
-    let roi = null;
-    if (costTotal > 0 && Number.isFinite(profitAfterAds)) {
-      roi = ((profitAfterAds + costTotal) / costTotal) * 100;
-    }
-    const roiStr  = fmtPct2(roi);
-    const roiIcon = (roi != null && roi < MTD_ROI_WARN_LT) ? '🔻' : '▫️';
-
-    const profitPerUnit = netCnt > 0 && Number.isFinite(profitAfterAds)
-      ? (profitAfterAds / netCnt) : null;
-    const ppuStr  = (profitPerUnit != null) ? `${fmtMoney0(profitPerUnit)}₽` : 'нет';
-    const ppuIcon = (profitPerUnit != null && profitPerUnit < MTD_PROFIT_PER_UNIT_WARN_LT) ? '🔻' : '▫️';
+    totalProfitAfterAds += profitAfterAds;
+    profitBySku.set(sku, profitAfterAds); // <— для ABC
 
     const titleApi = nameBySku.get(sku) || '';
     const display  = firstWord(titleApi) || `SKU ${sku}`;
@@ -843,30 +898,93 @@ async function makeLast30PerSkuText(user, { trackedSkus = [], db = null, chatId 
     const ctrIcon    = (ctr != null && ctr < MTD_CTR_WARN_LT) ? '🔻' : '▫️';
     const profitIcon = (Number.isFinite(profitAfterAds) && profitAfterAds < MTD_PROFIT_WARN_LT) ? '🔻' : '▫️';
 
-    // форматтеры
-    const qtyLine = (n) => Number(n) ? `${Math.round(Number(n)).toLocaleString('ru-RU')} шт.` : 'нет';
-    const qtyMoneyLine = (qty, sum) =>
-      Number(qty) ? `${Math.round(Number(qty)).toLocaleString('ru-RU')} шт. на ${fmtMoney0(sum)}₽` : 'нет';
+    // ROI и прибыль/шт.
+    let roi = null;
+    if (costTotal > 0 && Number.isFinite(profitAfterAds)) {
+      roi = ((profitAfterAds + costTotal) / costTotal) * 100;
+    }
+    const roiStr  = fmtPct2(roi);
+    const roiIcon = (roi != null && roi < MTD_ROI_WARN_LT) ? '🔻' : '▫️';
 
-    // вывод (без «Доставляется»)
+    const profitPerUnit = netCnt > 0 && Number.isFinite(profitAfterAds)
+      ? (profitAfterAds / netCnt) : null;
+    const ppuStr  = (profitPerUnit != null) ? `${fmtMoney0(profitPerUnit)}₽` : 'нет';
+    const ppuIcon = (profitPerUnit != null && profitPerUnit < MTD_PROFIT_PER_UNIT_WARN_LT) ? '🔻' : '▫️';
+
+perSku.set(sku, {
+  display, ord,
+  ctrStr, drrStr,
+  expenses,
+  profitAfterAds, ppuStr, roiStr,
+  icons: { pickupIcon, drrIcon, ctrIcon, profitIcon, ppuIcon, roiIcon },
+  pickupPercentStr,
+  netCnt, grossRev,
+  inTransitQty: Number(inTransitMap.get(sku) || 0), // ← ДОБАВИЛИ
+  returnsQty: Number(returnsMap.get(sku) || 0),
+  brakQty:    Number(brakMap.get(sku)    || 0),
+});
+  }
+
+  // ---------- ABC (по прибыли после рекламы) ----------
+  const abcMap = computeAbcByProfit(profitBySku);
+
+  // ---------- 2-й проход: вывод ----------
+  const lines = [];
+  lines.push(`<code>🏪 Магазин: ${esc(user.shop_name || 'Неизвестно')}</code>`);
+  lines.push('<code> - - - - </code>');
+  lines.push(`<code>📆 Период: ${esc(periodStartYmd)} → ${esc(periodEndYmd)}</code>`);
+  lines.push('<code> - - - - </code>');
+
+  const qtyLine = (n) => Number(n) ? `${Math.round(Number(n)).toLocaleString('ru-RU')} шт.` : 'нет';
+  const qtyMoneyLine = (qty, sum) =>
+    Number(qty) ? `${Math.round(Number(qty)).toLocaleString('ru-RU')} шт. на ${fmtMoney0(sum)}₽` : 'нет';
+
+  for (const sku of orderSkus) {
+    const s = perSku.get(sku);
+    if (!s) continue;
+
+const {
+  display, ord, ctrStr, drrStr, expenses,
+  profitAfterAds, ppuStr, roiStr,
+  icons, pickupPercentStr, netCnt, grossRev,
+  inTransitQty,                 // ← ДОБАВИЛИ
+  returnsQty, brakQty,
+} = s;
+
+const denom = Math.max(0, Number(ord.ordered || 0) - Number(inTransitQty || 0));
+let pickupStr = 'н/д';
+let pickupPct = null;
+if (denom > 0) {
+  const pct = (netCnt / denom) * 100;
+  pickupPct = pct;
+  pickupStr = `${Math.max(0, Math.min(100, Math.round(pct)))}%`;
+}
+
+    const abcClass = abcMap.get(sku) || 'C';
+    const abcStr   = abcBadge(abcClass);
+
     lines.push(`<code>📦 ${esc(display)} (${sku})</code>`);
-    lines.push(`<code>▫️ Заказано: ${qtyMoneyLine(ord.ordered, ord.revenue)}</code>`);
-    lines.push(`<code>▫️ Выкуплено: ${qtyMoneyLine(netCnt, grossRev)}</code>`);
-    lines.push(`<code>▫️ Возвраты: ${qtyLine(Number(returnsMap.get(sku) || 0))}</code>`);
-    lines.push(`<code>▫️ Брак (в возвратах): ${qtyLine(Number(brakMap.get(sku) || 0))}</code>`);
-    lines.push(`<code>${pickupIcon} Процент выкупа: ${pickupPercentStr}</code>`);
-    lines.push(`<code>${drrIcon} Д.Р.Р: ${drrStr}</code>`);
-    lines.push(`<code>${ctrIcon} CTR: ${ctrStr}</code>`);
-    lines.push(`<code>▫️ Расходы: ${Number(expenses) ? `${fmtMoney0(expenses)}₽` : 'нет'}</code>`);
-    lines.push(`<code>${profitIcon} Прибыль: ${Number.isFinite(profitAfterAds) ? `${fmtMoney0(profitAfterAds)}₽` : 'нет'}</code>`);
-    lines.push(`<code>${ppuIcon} Прибыль на шт.: ${ppuStr}</code>`);
-    lines.push(`<code>${roiIcon} ROI: ${roiStr}</code>`);
-    lines.push('<code> - - - - </code>');
+lines.push(`<code>▫️ Заказано: ${qtyMoneyLine(ord.ordered, ord.revenue)}</code>`);
+lines.push(`<code>▫️ Выкуплено: ${qtyMoneyLine(netCnt, grossRev)}</code>`);
+lines.push(`<code>▫️ Доставляется: ${qtyLine(inTransitQty)}</code>`);     // ← ДОБАВИЛИ
+lines.push(`<code>▫️ Возвраты: ${qtyLine(returnsQty)}</code>`);
+lines.push(`<code>▫️ Брак (в возвратах): ${qtyLine(brakQty)}</code>`);
+lines.push(`<code>${icons.pickupIcon} Процент выкупа: ${pickupStr}</code>`); // ← ИСПОЛЬЗУЕМ новую переменную
+lines.push(`<code>${icons.drrIcon} Д.Р.Р: ${drrStr}</code>`);
+lines.push(`<code>${icons.ctrIcon} CTR: ${ctrStr}</code>`);
+lines.push(`<code>▫️ Расходы: ${Number(expenses) ? `${fmtMoney0(expenses)}₽` : 'нет'}</code>`);
+lines.push(`<code>${icons.profitIcon} Прибыль: ${Number.isFinite(profitAfterAds) ? `${fmtMoney0(profitAfterAds)}₽` : 'нет'}</code>`);
+lines.push(`<code>${icons.ppuIcon} Прибыль на шт.: ${ppuStr}</code>`);
+lines.push(`<code>${icons.roiIcon} ROI: ${roiStr}</code>`);
+lines.push(`<code>${abcStr}</code>`);
+lines.push('<code> - - - - </code>');
+
   }
 
   lines.push(`<code>💰 Общая прибыль: ${fmtMoney0(totalProfitAfterAds)}₽</code>`);
   return lines.join('\n');
 }
+
 
 module.exports = {
   makeMtdPerSkuText,
