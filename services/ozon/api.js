@@ -1,95 +1,95 @@
 // services/ozon/api.js
-// Ozon Seller API: пер-клиентный лимит 2 rps + ретраи при rate limit/сетевых.
-
 const axios = require('axios');
-const Bottleneck = require('bottleneck');
+const https = require('https');
 
-// ==== Конфиг через ENV (можно не трогать) ====
-const REQUEST_TIMEOUT_MS   = Number(process.env.OZON_REQUEST_TIMEOUT_MS || 20000);
+// ——— Настройки через ENV (есть дефолты)
+const OZON_TIMEOUT_MS    = Number(process.env.OZON_TIMEOUT_MS ?? 45000); // было 20000
+const OZON_GLOBAL_RPS    = Number(process.env.OZON_GLOBAL_RPS ?? 2);     // 2 req/sec
+const OZON_CONCURRENCY   = Number(process.env.OZON_CONCURRENCY ?? 2);    // параллелизм
+const OZON_MAX_RETRIES   = Number(process.env.OZON_MAX_RETRIES ?? 5);
+const OZON_BACKOFF_BASE  = Number(process.env.OZON_BACKOFF_BASE_MS ?? 300);
 
-// 2 запроса/сек на client_id (можно поменять через ENV)
-const PER_CLIENT_RPS       = Number(process.env.OZON_PER_CLIENT_RPS || 2);
+// keep-alive агент — сильно снижает задержки
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 
-// Ретраи при rate-limit/временных ошибках
-const MAX_RETRIES          = Number(process.env.OZON_MAX_RETRIES || 5);
-const BACKOFF_BASE_MS      = Number(process.env.OZON_BACKOFF_BASE_MS || 300);
-const BACKOFF_MAX_MS       = Number(process.env.OZON_BACKOFF_MAX_MS || 5000);
-
-// (опц.) Глобальная конкуррентность, чтобы не забить сеть/CPU
-const GLOBAL_MAX_CONCURRENCY = Number(process.env.OZON_GLOBAL_MAX_CONCURRENCY || 4);
-
-// ==== Лимитеры ====
-// Глобально ограничим одновременные HTTP (не rps, а concurrency)
-const globalLimiter = new Bottleneck({ maxConcurrent: GLOBAL_MAX_CONCURRENCY });
-
-// Группа помагазинных лимитеров: на КАЖДЫЙ client_id — 2 токена/сек
-const perClientGroup = new Bottleneck.Group({
-  maxConcurrent: 1,                        // по одному запросу на client_id одновременно
-  reservoir: PER_CLIENT_RPS,               // стартовое число токенов
-  reservoirRefreshAmount: PER_CLIENT_RPS,  // каждые 1000 мс пополняем до PER_CLIENT_RPS
-  reservoirRefreshInterval: 1000,
+const client = axios.create({
+  baseURL: 'https://api-seller.ozon.ru',
+  timeout: OZON_TIMEOUT_MS,
+  httpsAgent,
+  headers: { 'Content-Type': 'application/json' },
+  validateStatus: (s) => s >= 200 && s < 300,
 });
 
-// ==== Ретраи ====
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+// Что ретраим
+function isRetryable(err) {
+  const status = err?.response?.status;
+  const apiCode = err?.response?.data?.code;
+  const sysCode = err?.code;
 
-function isRateLimitError(err) {
-  const http = err?.response?.status;
-  const code = err?.response?.data?.code;
-  const msg  = String(err?.response?.data?.message || err?.message || '').toLowerCase();
-  return http === 429 || code === 8 || msg.includes('rate limit');
+  const netErr = ['ECONNABORTED', 'ETIMEDOUT', 'ECONNRESET', 'ENOTFOUND'].includes(sysCode);
+  const rate   = status === 429 || apiCode === 8;
+  const srv    = status >= 500 && status < 600;
+
+  return netErr || rate || srv;
 }
 
-function isRetryableNetwork(err) {
-  const http = err?.response?.status;
-  const code = err?.code;
-  return (http >= 500 && http < 600) || code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'EAI_AGAIN';
+// Простейший token-bucket + ограничение конкуренции
+let tokens = OZON_GLOBAL_RPS;
+let running = 0;
+const q = []; // очередь задач
+
+setInterval(() => {
+  tokens = Math.min(tokens + OZON_GLOBAL_RPS, OZON_GLOBAL_RPS);
+  drain();
+}, 1000);
+
+function schedule(taskFn) {
+  return new Promise((resolve, reject) => {
+    q.push({ taskFn, resolve, reject });
+    drain();
+  });
 }
 
-function nextDelayMs(err, attempt) {
-  const hdr = err?.response?.headers?.['retry-after'];
-  if (hdr) {
-    const sec = Number(hdr);
-    if (Number.isFinite(sec) && sec > 0) return sec * 1000;
+function drain() {
+  while (running < OZON_CONCURRENCY && tokens > 0 && q.length) {
+    const { taskFn, resolve, reject } = q.shift();
+    tokens--;
+    running++;
+    taskFn()
+      .then(resolve, reject)
+      .finally(() => {
+        running--;
+        drain();
+      });
   }
-  const base = BACKOFF_BASE_MS * Math.pow(2, attempt); // 300, 600, 1200, 2400, 4800...
-  const jitter = Math.floor(Math.random() * 200);
-  return Math.min(BACKOFF_MAX_MS, base + jitter);
 }
 
-// ==== Публичная функция ====
-async function ozonApiRequest({ client_id, api_key, endpoint, body }) {
-  const url = `https://api-seller.ozon.ru${endpoint}`;
-  const headers = {
-    'Client-Id': client_id,
-    'Api-Key': api_key,
-    'Content-Type': 'application/json',
-  };
-
-  // лимитер на конкретный client_id
-  const perClientLimiter = perClientGroup.key(String(client_id || 'NOCLIENT'));
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      // Каждый заход в цикл забирает НОВЫЙ токен per-client (≤2 rps) и проходит через глобальную concurrency
-      const data = await globalLimiter.schedule(() =>
-        perClientLimiter.schedule(() =>
-          axios.post(url, body, { headers, timeout: REQUEST_TIMEOUT_MS, baseURL: 'https://api-seller.ozon.ru' })
-        )
-      );
-      return data.data; // axios response.data
-    } catch (err) {
-      const retryable = isRateLimitError(err) || isRetryableNetwork(err);
-      if (!retryable || attempt >= MAX_RETRIES) throw err;
-
-      const ms = nextDelayMs(err, attempt);
-      // console.warn(`[ozonApiRequest] retry in ${ms}ms (attempt ${attempt+1}/${MAX_RETRIES})`, err?.response?.data || err.message);
-      await sleep(ms);
-      // цикл продолжится и снова возьмёт токен из per-client лимитера (не превысим 2 rps)
+async function ozonApiRequest({ client_id, api_key, endpoint, body, method = 'post' }) {
+  const run = async () => {
+    for (let attempt = 0; attempt < OZON_MAX_RETRIES; attempt++) {
+      try {
+        const res = await client.request({
+          url: endpoint,
+          method,
+          data: body,
+          headers: {
+            'Client-Id': String(client_id),
+            'Api-Key':   String(api_key),
+          },
+        });
+        return res.data;
+      } catch (err) {
+        const last = attempt >= OZON_MAX_RETRIES - 1;
+        if (!isRetryable(err) || last) throw err;
+        const pause = Math.min(
+          OZON_BACKOFF_BASE * Math.pow(2, attempt) + Math.floor(Math.random() * 200),
+          5000
+        );
+        await new Promise(r => setTimeout(r, pause));
+      }
     }
-  }
-
-  throw new Error('Ozon API retries exhausted');
+  };
+  return schedule(run);
 }
 
 module.exports = { ozonApiRequest };

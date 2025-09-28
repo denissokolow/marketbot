@@ -24,6 +24,7 @@ const YEST_STOCK_WARN_LT   = Number(process.env.YEST_STOCK_WARN_LT ?? 10);  // �
 const MTD_DRR_WARN_GT      = Number(process.env.MTD_DRR_WARN_GT ?? 10);     // Д.Р.Р. > → ❗ (и 🔺 в первом сообщении)
 const MTD_CTR_WARN_LT      = Number(process.env.MTD_CTR_WARN_LT ?? 2.5);    // CTR < → 🔻
 
+// Новые пороги (для первого сообщения)
 const YEST_SOINVEST_WARN_LT = Number(process.env.YEST_SOINVEST_WARN_LT ?? 10); // Соинвест < → 🔺
 const YEST_SVD_WARN_GT      = Number(process.env.YEST_SVD_WARN_GT ?? 29);      // СВД > → 🔺
 
@@ -90,6 +91,7 @@ function esc(s = '') {
     .replace(/>/g, '&gt;');
 }
 
+// Формат с 2 знаками после запятой
 function format2(num) {
   if (num == null || !isFinite(num)) return '-';
   return Number(num).toLocaleString('ru-RU', {
@@ -98,10 +100,12 @@ function format2(num) {
   }) + '%';
 }
 
+// Первое слово из названия
 function firstWord(s = '') {
   return String(s).trim().split(/\s+/)[0] || '';
 }
 
+// «в названии причины возврата есть "брак"»
 const includesBrak = (s) => typeof s === 'string' && s.toLowerCase().includes('брак');
 
 // --------- API helpers: СВД и Соинвест ---------
@@ -135,7 +139,7 @@ async function fetchSoinvestAvg({ client_id, api_key, trackedSkus }) {
   // 1) sku -> product_id
   const skuToPid = new Map();
   let cursor = '';
-  for (let i = 0; i < 50; i++) {
+  for (let i = 0; i < 50; i++) { // безопасная отсечка по страницам
     const resp = await ozonApiRequest({
       client_id, api_key,
       endpoint: '/v4/product/info/stocks',
@@ -156,10 +160,11 @@ async function fetchSoinvestAvg({ client_id, api_key, trackedSkus }) {
         }
       }
     }
+    // пагинация
     const nextCursor = resp?.result?.cursor ?? resp?.cursor ?? '';
     cursor = typeof nextCursor === 'string' ? nextCursor : '';
     if (!cursor) break;
-    if (skuToPid.size >= trackedSet.size) break;
+    if (skuToPid.size >= trackedSet.size) break; // всё нашли
   }
 
   const productIds = Array.from(new Set([...skuToPid.values()])).filter(Number.isFinite);
@@ -185,7 +190,7 @@ async function fetchSoinvestAvg({ client_id, api_key, trackedSkus }) {
         const mp  = Number(it?.price?.marketing_price ?? 0);
         const msp = Number(it?.price?.marketing_seller_price ?? 0);
         if (msp > 0 && mp > 0 && mp <= msp) {
-          const pct = (1 - mp / msp) * 100;
+          const pct = (1 - mp / msp) * 100; // доля снижения от цены продавца
           if (Number.isFinite(pct)) pcts.push(pct);
         }
       }
@@ -333,7 +338,7 @@ async function makeReportText(user, date, opts = {}) {
     const adSpendLine = adSpendPerf == null ? '-' : `${formatMoney(adSpendPerf)}₽`;
     const drrLine     = drrPerf == null     ? '-' : format2(drrPerf);
     const ctrLine     = ctrPerf == null     ? '-' : format2(ctrPerf);
-    const svdLine     = svdAvg == null      ? '-' : `${svdAvg} ч.`;   // ч. — как просили
+    const svdLine     = svdAvg == null      ? '-' : `${svdAvg} ч.`;   // ч. — как договорились
     const soiLine     = soinvestAvg == null ? '-' : `${soinvestAvg}%`;
 
     lines.push(`▫️ Расходы на рекламу:  ${adSpendLine}`);
@@ -356,53 +361,35 @@ async function makeReportText(user, date, opts = {}) {
 async function getReturnsBySkuForDate({ client_id, api_key, date }) {
   const fromISO = `${date}T00:00:00.000Z`;
   const toISO   = `${date}T23:59:59.999Z`;
-
   const limit = 500;
   let last_id = 0;
-
-  const counts    = new Map(); // sku -> qty
-  const brakCounts= new Map(); // sku -> qty
-  const seen      = new Set();
+  const counts = new Map();
+  const brakCounts = new Map();
+  const seen = new Set();
 
   while (true) {
     const resp = await ozonApiRequest({
       client_id, api_key,
       endpoint: '/v1/returns/list',
-      body: {
-        filter: { logistic_return_date: { time_from: fromISO, time_to: toISO } },
-        limit,
-        last_id
-      },
+      body: { filter: { logistic_return_date: { time_from: fromISO, time_to: toISO } }, limit, last_id },
     });
-
-    // <- ВАЖНО: у Ozon данные могут быть как в resp.result.*, так и на корне
-    const result = resp?.result ?? resp ?? {};
-    const items  = Array.isArray(result.returns) ? result.returns : [];
-
-    if (!items.length) {
-      // если нет элементов и нет has_next — выходим
-      if (!result.has_next) break;
-    }
+    const items = resp?.result?.returns || [];
+    if (!items.length) break;
 
     for (const it of items) {
-      // sku в ответе находится в product.sku
-      const sku = Number(it?.product?.sku ?? it?.sku ?? 0);
+      const sku = Number(it?.sku ?? it?.product?.sku ?? it?.product_id?.sku ?? 0);
       if (!Number.isFinite(sku)) continue;
 
-      // дедуп по id (или fallback по posting_number+sku+index)
       const id  = it?.id ?? it?.return_id ?? it?.acceptance_id ?? null;
       const pn  = it?.posting_number || it?.posting?.posting_number || '';
       const idx = it?.item_index ?? it?.item_id ?? it?.index ?? 0;
       const key = id != null ? `id:${id}` : `pn:${pn}|sku:${sku}|idx:${idx}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
+      if (seen.has(key)) continue; seen.add(key);
 
-      // количество — корректно берём из product.quantity, иначе фолбэки
-      const q = Number.isFinite(Number(it?.product?.quantity))
-        ? Number(it.product.quantity)
-        : Number.isFinite(Number(it?.quantity))      ? Number(it.quantity)
-        : Number.isFinite(Number(it?.return_count))  ? Number(it.return_count)
-        : Number.isFinite(Number(it?.qty))           ? Number(it.qty)
+      const q = Number.isFinite(Number(it?.quantity))
+        ? Number(it?.quantity)
+        : Number.isFinite(Number(it?.return_count)) ? Number(it?.return_count)
+        : Number.isFinite(Number(it?.qty)) ? Number(it?.qty)
         : 1;
 
       counts.set(sku, (counts.get(sku) || 0) + q);
@@ -413,74 +400,12 @@ async function getReturnsBySkuForDate({ client_id, api_key, date }) {
       }
     }
 
-    // пагинация: has_next / last_id могут быть как в result, так и на корне
-    const hasNext = Boolean(result.has_next);
-    if (!hasNext) break;
-
-    const nextLastId = Number(result.last_id ?? (items.length ? items[items.length - 1].id : 0));
-    if (!nextLastId || nextLastId === last_id) break;
-    last_id = nextLastId;
+    const next = Number(resp?.result?.last_id ?? 0);
+    if (!next || next === last_id) break;
+    last_id = next;
   }
 
   return { counts, brakCounts };
-}
-
-// Fallback/дополнение: возвраты из финопераций с items (accruals_for_sale < 0)
-async function getFinanceReturnsBySkuForDate({ client_id, api_key, date }) {
-  const fromISO = `${date}T00:00:00.000Z`;
-  const toISO   = `${date}T23:59:59.999Z`;
-  const page_size = 1000;
-  let page = 1;
-  const counts = new Map();
-
-  while (true) {
-    const resp = await ozonApiRequest({
-      client_id, api_key,
-      endpoint: '/v3/finance/transaction/list',
-      body: {
-        filter: {
-          date: { from: fromISO, to: toISO },
-          operation_type: [],
-          posting_number: '',
-          transaction_type: 'all',
-        },
-        page,
-        page_size,
-      },
-    });
-    const ops = Array.isArray(resp?.result?.operations) ? resp.result.operations : [];
-    if (!ops.length) break;
-
-    for (const op of ops) {
-      const items = Array.isArray(op?.items) ? op.items : [];
-      if (!items.length) continue;
-      const accr = Number(op?.accruals_for_sale || 0);
-      if (accr >= 0) continue; // интересуют только «минус продажи» (возвраты/отмены с items)
-
-      for (const it of items) {
-        const sku = Number(it?.sku || 0);
-        const qty = Number(it?.quantity || 0) || 1;
-        if (!Number.isFinite(sku)) continue;
-        counts.set(sku, (counts.get(sku) || 0) + qty);
-      }
-    }
-
-    if (resp?.result?.has_next === true) {
-      page += 1;
-    } else break;
-  }
-
-  return counts;
-}
-
-function mergeReturnsMax(primaryMap, secondaryMap) {
-  // объединяем по максимуму, чтобы не задвоить при совпадении из двух источников
-  const out = new Map(primaryMap);
-  for (const [sku, qty] of secondaryMap.entries()) {
-    const cur = Number(out.get(sku) || 0);
-    if (qty > cur) out.set(sku, qty);
-  }
-  return out;
 }
 
 // --------------------------------- Второе сообщение ---------------------------------
@@ -540,22 +465,14 @@ async function makeSkuBreakdownText(user, date, opts = {}) {
     console.error('[makeSkuBreakdownText] ordered map error (after retries):', e?.response?.data || e.message);
   }
 
-  // 3) Возвраты/брак за день по SKU — сначала из returns/list
-  let { counts: returnsMap, brakCounts: brakMap } = await getReturnsBySkuForDate({
+  // 3) Возвраты/брак за день по SKU — СНАЧАЛА тянем возвраты
+  const { counts: returnsMap, brakCounts: brakMap } = await getReturnsBySkuForDate({
     client_id: user.client_id,
     api_key:   user.seller_api,
     date,
   });
 
-  // 3.1) Дополняем/страхуем возвратами из финопераций (min- продажи с items)
-  try {
-    const finReturns = await getFinanceReturnsBySkuForDate({ client_id: user.client_id, api_key: user.seller_api, date });
-    returnsMap = mergeReturnsMax(returnsMap, finReturns);
-  } catch (e) {
-    console.warn('[makeSkuBreakdownText] finance returns fallback error:', e?.response?.data || e.message);
-  }
-
-  // 4) Итоговый набор SKU — объединяем заказы, выкупы и возвраты
+  // 4) Итоговый набор SKU для вывода — объединяем заказы, выкупы И возвраты
   let finalSkus;
   if (trackedSkus && trackedSkus.length) {
     finalSkus = trackedSkus;
@@ -563,13 +480,13 @@ async function makeSkuBreakdownText(user, date, opts = {}) {
     const set = new Set([
       ...Array.from(orderedMap.keys()),
       ...Array.from(buyoutBySku.keys()),
-      ...Array.from(returnsMap.keys()),
+      ...Array.from(returnsMap.keys()), // важно: добавить SKU только с возвратами
     ]);
     finalSkus = Array.from(set.values());
   }
   if (!finalSkus.length) return '<code>Данных по позициям нет.</code>';
 
-  // 5) Остатки — по финальному набору
+  // 5) Остатки — уже по финальному набору
   let stockMap = new Map();
   try {
     stockMap = await getStocksSumBySkusChunked({
@@ -598,6 +515,7 @@ async function makeSkuBreakdownText(user, date, opts = {}) {
       if (rr.rowCount) {
         const perfId     = rr.rows[0].performance_client_id;
         const perfSecret = rr.rows[0].performance_secret;
+        // веса для «все товары» — пропорционально выручке за день
         const allocationWeights = {};
         for (const sku of finalSkus) {
           allocationWeights[sku] = Number(orderedMap.get(sku)?.revenue || 0);
@@ -629,6 +547,7 @@ async function makeSkuBreakdownText(user, date, opts = {}) {
   lines.push(`<code>📆 Отчёт по товарам за: ${esc(date)}</code>`);
   lines.push('<code> - - - - </code>');
 
+  // Сортировка: по выручке за день
   const orderedSkus = [...new Set(finalSkus)].sort((a,b) => {
     const ra = Number(orderedMap.get(a)?.revenue || 0);
     const rb = Number(orderedMap.get(b)?.revenue || 0);
