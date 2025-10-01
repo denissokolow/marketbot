@@ -1,21 +1,15 @@
-//src/commands/register.js
+// src/commands/register.js
 const axios = require('axios');
-const { replyCode, sendWelcomeCard } = require('../utils/replies');
-const { request: ozonRequest } = require('../services/ozon/client');
-const regSteps = Object.create(null);
 const fs = require('fs');
 const path = require('path');
 
-// --- утилиты и валидации ---
-const MIN_SHOP_NAME_LEN = 2;
-const MAX_SHOP_NAME_LEN = Number(process.env.SHOP_NAME_MAX_LEN || 80);
-const CLIENT_ID_MAX_LEN = Number(process.env.CLIENT_ID_MAX_LEN || 16);
-const API_KEY_MAX_LEN   = Number(process.env.API_KEY_MAX_LEN || 128);
-const PERF_ID_MAX_LEN   = Number(process.env.PERF_CLIENT_ID_MAX_LEN || 128);
-const PERF_SEC_MAX_LEN  = Number(process.env.PERF_SECRET_MAX_LEN || 256);
-const PERF_SEC_MIN_LEN  = Number(process.env.PERF_SECRET_MIN_LEN || 16);
-const VERIFY_SELLER     = process.env.VERIFY_SELLER_KEYS !== '0';
-const VERIFY_PERF       = process.env.VERIFY_PERF_KEYS   !== '0';
+const { replyCode, sendWelcomeCard } = require('../utils/replies');
+const { request: ozonRequest } = require('../services/ozon/client');
+const { fetchAllTurnoverStocks } = require('../services/ozon/stocks');
+
+const regSteps = Object.create(null);
+
+/* ===================== фото-подсказки ===================== */
 
 // Преобразуем env-строку в корректный инпут для sendPhoto (file_id / URL / локальный путь)
 function photoInputFromEnv(val) {
@@ -60,6 +54,18 @@ async function showStepTip(ctx, step) {
     console.warn(`[register] step ${step} tip failed:`, e?.message || e);
   }
 }
+
+/* ===================== валидации и утилиты ===================== */
+
+const MIN_SHOP_NAME_LEN = 2;
+const MAX_SHOP_NAME_LEN = Number(process.env.SHOP_NAME_MAX_LEN || 80);
+const CLIENT_ID_MAX_LEN = Number(process.env.CLIENT_ID_MAX_LEN || 16);
+const API_KEY_MAX_LEN   = Number(process.env.API_KEY_MAX_LEN || 128);
+const PERF_ID_MAX_LEN   = Number(process.env.PERF_CLIENT_ID_MAX_LEN || 128);
+const PERF_SEC_MAX_LEN  = Number(process.env.PERF_SECRET_MAX_LEN || 256);
+const PERF_SEC_MIN_LEN  = Number(process.env.PERF_SECRET_MIN_LEN || 16);
+const VERIFY_SELLER     = process.env.VERIFY_SELLER_KEYS !== '0';
+const VERIFY_PERF       = process.env.VERIFY_PERF_KEYS   !== '0';
 
 function sanitizeShopName(raw) {
   let s = String(raw ?? '').replace(/[\u0000-\u001F\u007F]/g, ' ')
@@ -142,7 +148,8 @@ async function verifyPerformanceCredentials(perf_client_id, perf_secret) {
   }
 }
 
-// --- команда ---
+/* ===================== команда ===================== */
+
 module.exports.register = (bot, { pool, logger }) => {
   // /register — если не зарегистрирован, показываем ту же welcome-карточку
   bot.command('register', async (ctx) => {
@@ -150,7 +157,7 @@ module.exports.register = (bot, { pool, logger }) => {
     try {
       const u = await pool.query('select id from users where chat_id=$1 limit 1', [chatId]);
       if (!u.rowCount) {
-        await sendWelcomeCard(ctx);                 // то же сообщение, что и /start
+        await sendWelcomeCard(ctx); // то же сообщение, что и /start
         return;
       }
       await replyCode(ctx, 'Вы уже зарегистрированы. Используйте меню команд для работы.');
@@ -159,197 +166,250 @@ module.exports.register = (bot, { pool, logger }) => {
       await replyCode(ctx, '⚠️ Ошибка. Попробуйте позже.');
     }
   });
-// кнопка «Регистрация» — запуск пошаговой регистрации
-bot.action('register_begin', async (ctx) => {
-  try {
-    await ctx.answerCbQuery(); // закрыть "Загрузка…"
 
-    const chatId = ctx.from.id;
+  // кнопка «Регистрация» — запуск пошаговой регистрации
+  bot.action('register_begin', async (ctx) => {
+    try {
+      await ctx.answerCbQuery(); // закрыть "Загрузка…"
 
-    // уже зарегистрирован?
-    const u = await pool.query('select id from users where chat_id=$1 limit 1', [chatId]);
-    if (u.rowCount) {
-      await replyCode(ctx, 'Вы уже зарегистрированы. Откройте «Меню» для работы.');
-      return;
+      const chatId = ctx.from.id;
+
+      // уже зарегистрирован?
+      const u = await pool.query('select id from users where chat_id=$1 limit 1', [chatId]);
+      if (u.rowCount) {
+        await replyCode(ctx, 'Вы уже зарегистрированы. Откройте «Меню» для работы.');
+        return;
+      }
+
+      // стартуем мастер
+      regSteps[chatId] = { step: 1 };
+      await replyCode(ctx, 'Введите название вашего магазина на Ozon:');
+    } catch (e) {
+      logger.error(e, 'register_begin error');
+      await replyCode(ctx, '⚠️ Не удалось начать регистрацию. Попробуйте ещё раз.');
     }
+  });
 
-    // стартуем мастер
-    regSteps[chatId] = { step: 1 };
-    await replyCode(ctx, 'Введите название вашего магазина на Ozon:');
-  } catch (e) {
-    logger.error(e, 'register_begin error');
-    await replyCode(ctx, '⚠️ Не удалось начать регистрацию. Попробуйте ещё раз.');
-  }
-});
-// пошаговая регистрация (НЕ глушим команды — используем next())
-bot.on('text', async (ctx, next) => {
-  const chatId = ctx.from?.id;
-  const text = ctx.message?.text || '';
-  const state = regSteps[chatId];
+  // пошаговая регистрация (НЕ глушим команды — используем next())
+  bot.on('text', async (ctx, next) => {
+    const chatId = ctx.from?.id;
+    const text = ctx.message?.text || '';
+    const state = regSteps[chatId];
 
-  // если не в процессе регистрации ИЛИ это команда — пропускаем дальше
-  if (!state || text.startsWith('/')) return next();
+    // если не в процессе регистрации ИЛИ это команда — пропускаем дальше
+    if (!state || text.startsWith('/')) return next();
 
-  try {
-    // 1) shop name
-    if (state.step === 1) {
-      const s = sanitizeShopName(text);
-      const v = validateShopName(s);
-      if (!v.ok) {
-        await replyCode(ctx, `⚠️ ${v.err}`);
-        return;
-      }
-      state.shop_name = s;
-      state.step = 2;
-      await showStepTip(ctx, 2);
-      await replyCode(ctx, 'Введите ваш client_id для Seller API:');
-      return;
-    }
-
-    // 2) client_id
-    if (state.step === 2) {
-      const cid = sanitizeClientId(text);
-      const v = validateClientId(cid);
-      if (!v.ok) {
-        await showStepTip(ctx, 2);
-        await replyCode(ctx, `⚠️ ${v.err}`);
-        return;
-      }
-
-      // Не даём использовать client_id, который уже привязан к другому магазину
-      const ex = await pool.query('select 1 from shops where ozon_client_id = $1 limit 1', [cid]);
-      if (ex.rowCount) {
-        await showStepTip(ctx, 2);
-        await replyCode(ctx, '⚠️ Такой client_id уже используется. Укажите другой.');
-        return;
-      }
-
-      state.client_id = cid;
-      state.step = 3;
-      await showStepTip(ctx, 3);
-      await replyCode(ctx, 'Введите ваш api_key для Seller API:');
-      return;
-    }
-
-    // 3) api_key + онлайн-проверка пары seller
-    if (state.step === 3) {
-      const key = sanitizeApiKey(text);
-      const v = validateApiKey(key);
-      if (!v.ok) {
-        await showStepTip(ctx, 3);
-        await replyCode(ctx, `⚠️ ${v.err}`);
-        return;
-      }
-
-      const ok = await verifySellerCredentials(state.client_id, key);
-      if (!ok) {
-        // Откат НА ШАГ 2 + подсказка
+    try {
+      // 1) shop name
+      if (state.step === 1) {
+        const s = sanitizeShopName(text);
+        const v = validateShopName(s);
+        if (!v.ok) {
+          await replyCode(ctx, `⚠️ ${v.err}`);
+          return;
+        }
+        state.shop_name = s;
         state.step = 2;
-        state.client_id = undefined;
-        await replyCode(ctx, '⚠️ Не удалось авторизоваться в Seller API. Проверьте client_id и api_key.');
         await showStepTip(ctx, 2);
         await replyCode(ctx, 'Введите ваш client_id для Seller API:');
         return;
       }
 
-      state.api_key = key;
-      state.step = 4;
-      await showStepTip(ctx, 4);
-      await replyCode(ctx, 'Введите ваш performance_client_id для Performance API:');
-      return;
-    }
+      // 2) client_id
+      if (state.step === 2) {
+        const cid = sanitizeClientId(text);
+        const v = validateClientId(cid);
+        if (!v.ok) {
+          await showStepTip(ctx, 2);
+          await replyCode(ctx, `⚠️ ${v.err}`);
+          return;
+        }
 
-    // 4) perf_client_id
-    if (state.step === 4) {
-      const pid = sanitizePerfId(text);
-      const v = validatePerfId(pid);
-      if (!v.ok) {
-        await showStepTip(ctx, 4);
-        await replyCode(ctx, `⚠️ ${v.err}`);
+        // Не даём использовать client_id, который уже привязан к другому магазину
+        const ex = await pool.query('select 1 from shops where ozon_client_id = $1 limit 1', [cid]);
+        if (ex.rowCount) {
+          await showStepTip(ctx, 2);
+          await replyCode(ctx, '⚠️ Такой client_id уже используется. Укажите другой.');
+          return;
+        }
+
+        state.client_id = cid;
+        state.step = 3;
+        await showStepTip(ctx, 3);
+        await replyCode(ctx, 'Введите ваш api_key для Seller API:');
         return;
       }
 
-      const ex = await pool.query('select 1 from shops where perf_client_id = $1 limit 1', [pid]);
-      if (ex.rowCount) {
-        await showStepTip(ctx, 4);
-        await replyCode(ctx, '⚠️ Такой performance_client_id уже используется. Укажите другой.');
-        return;
-      }
+      // 3) api_key + онлайн-проверка пары seller
+      if (state.step === 3) {
+        const key = sanitizeApiKey(text);
+        const v = validateApiKey(key);
+        if (!v.ok) {
+          await showStepTip(ctx, 3);
+          await replyCode(ctx, `⚠️ ${v.err}`);
+          return;
+        }
 
-      state.perf_client_id = pid;
-      state.step = 5;
-      await showStepTip(ctx, 5);
-      await replyCode(ctx, 'Введите ваш performance_secret (secret_key) для Performance API:');
-      return;
-    }
+        const ok = await verifySellerCredentials(state.client_id, key);
+        if (!ok) {
+          // Откат НА ШАГ 2 + подсказка
+          state.step = 2;
+          state.client_id = undefined;
+          await replyCode(ctx, '⚠️ Не удалось авторизоваться в Seller API. Проверьте client_id и api_key.');
+          await showStepTip(ctx, 2);
+          await replyCode(ctx, 'Введите ваш client_id для Seller API:');
+          return;
+        }
 
-    // 5) perf_secret + онлайн-проверка
-    if (state.step === 5) {
-      const sec = sanitizePerfSecret(text);
-      const v = validatePerfSecret(sec);
-      if (!v.ok) {
-        await showStepTip(ctx, 5);
-        await replyCode(ctx, `⚠️ ${v.err}`);
-        return;
-      }
-
-      const ok = await verifyPerformanceCredentials(state.perf_client_id, sec);
-      if (!ok) {
-        // Откат НА ШАГ 4 + подсказка
+        state.api_key = key;
         state.step = 4;
-        await replyCode(ctx, '⚠️ Не удалось подтвердить доступ к Ozon Performance. Повторите данные.');
         await showStepTip(ctx, 4);
         await replyCode(ctx, 'Введите ваш performance_client_id для Performance API:');
         return;
       }
 
-      // Сохраняем в БД
-      const first_name = ctx.from.first_name || null;
-      const last_name  = ctx.from.last_name  || null;
+      // 4) perf_client_id
+      if (state.step === 4) {
+        const pid = sanitizePerfId(text);
+        const v = validatePerfId(pid);
+        if (!v.ok) {
+          await showStepTip(ctx, 4);
+          await replyCode(ctx, `⚠️ ${v.err}`);
+          return;
+        }
 
-      await pool.query('BEGIN');
+        const ex = await pool.query('select 1 from shops where perf_client_id = $1 limit 1', [pid]);
+        if (ex.rowCount) {
+          await showStepTip(ctx, 4);
+          await replyCode(ctx, '⚠️ Такой performance_client_id уже используется. Укажите другой.');
+          return;
+        }
 
-      // users: upsert по chat_id
-      const u = await pool.query(
-        `insert into users (chat_id, first_name, last_name, is_subscribed, created_at)
-         values ($1, $2, $3, false, now())
-         on conflict (chat_id) do update set
-           first_name = excluded.first_name,
-           last_name  = excluded.last_name
-         returning id`,
-        [chatId, first_name, last_name]
-      );
-      const userId = u.rows[0].id;
+        state.perf_client_id = pid;
+        state.step = 5;
+        await showStepTip(ctx, 5);
+        await replyCode(ctx, 'Введите ваш performance_secret (secret_key) для Performance API:');
+        return;
+      }
 
-      // shops: 1 пользователь → 1 магазин (unique user_id)
-      await pool.query(
-        `insert into shops (user_id, name, ozon_client_id, ozon_api_key, perf_client_id, perf_client_secret, created_at)
-         values ($1, $2, $3, $4, $5, $6, now())
-         on conflict (user_id) do update set
-           name               = excluded.name,
-           ozon_client_id     = excluded.ozon_client_id,
-           ozon_api_key       = excluded.ozon_api_key,
-           perf_client_id     = excluded.perf_client_id,
-           perf_client_secret = excluded.perf_client_secret`,
-        [userId, state.shop_name, state.client_id, state.api_key, state.perf_client_id, sec]
-      );
+      // 5) perf_secret + онлайн-проверка
+      if (state.step === 5) {
+        const sec = sanitizePerfSecret(text);
+        const v = validatePerfSecret(sec);
+        if (!v.ok) {
+          await showStepTip(ctx, 5);
+          await replyCode(ctx, `⚠️ ${v.err}`);
+          return;
+        }
 
-      await pool.query('COMMIT');
+        const ok = await verifyPerformanceCredentials(state.perf_client_id, sec);
+        if (!ok) {
+          // Откат НА ШАГ 4 + подсказка
+          state.step = 4;
+          await replyCode(ctx, '⚠️ Не удалось подтвердить доступ к Ozon Performance. Повторите данные.');
+          await showStepTip(ctx, 4);
+          await replyCode(ctx, 'Введите ваш performance_client_id для Performance API:');
+          return;
+        }
 
-      await replyCode(ctx, 'Вы успешно зарегистрированы! Откройте кнопку «Меню» для работы.');
+        /* ===== Сохраняем в БД (подписка на 5 дней) ===== */
+        const first_name = ctx.from.first_name || null;
+        const last_name  = ctx.from.last_name  || null;
+
+        await pool.query('BEGIN');
+
+        // users: upsert по chat_id
+        // - is_subscribed = TRUE
+        // - subscription_until = created_at + 5 days
+        const u = await pool.query(
+          `INSERT INTO users (chat_id, first_name, last_name, is_subscribed, subscription_until, created_at)
+           VALUES ($1, $2, $3, TRUE, NOW() + INTERVAL '5 days', NOW())
+           ON CONFLICT (chat_id) DO UPDATE SET
+             first_name         = EXCLUDED.first_name,
+             last_name          = EXCLUDED.last_name,
+             is_subscribed      = TRUE,
+             subscription_until = users.created_at + INTERVAL '5 days'
+           RETURNING id`,
+          [chatId, first_name, last_name]
+        );
+        const userId = u.rows[0].id;
+
+        // shops: 1 пользователь → 1 магазин (unique user_id). Возвращаем id.
+        const s = await pool.query(
+          `INSERT INTO shops (user_id, name, ozon_client_id, ozon_api_key, perf_client_id, perf_client_secret, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, NOW())
+           ON CONFLICT (user_id) DO UPDATE SET
+             name               = EXCLUDED.name,
+             ozon_client_id     = EXCLUDED.ozon_client_id,
+             ozon_api_key       = EXCLUDED.ozon_api_key,
+             perf_client_id     = EXCLUDED.perf_client_id,
+             perf_client_secret = EXCLUDED.perf_client_secret
+           RETURNING id`,
+          [userId, state.shop_name, state.client_id, state.api_key, state.perf_client_id, sec]
+        );
+        const shopId = s.rows[0].id;
+
+        await pool.query('COMMIT');
+
+        /* ===== После регистрации: подтягиваем остатки и пишем shop_products ===== */
+        try {
+          // 1) забираем все items (универсальный метод, пагинация внутри)
+          const items = await fetchAllTurnoverStocks(
+            { client_id: state.client_id, api_key: state.api_key },
+            { limit: 500 }
+          );
+
+          // 2) только с положительным остатком
+          const rows = items
+            .filter(it => Number(it?.current_stock) > 0)
+            .map(it => ({
+              sku: Number(it.sku),
+              title: String(it.name || it.offer_id || ''),
+              quantity: Number(it.current_stock) || 0
+            }));
+
+          // 3) транзакция апдейта остатков
+          await pool.query('BEGIN');
+          await pool.query('UPDATE shop_products SET quantity = 0 WHERE shop_id = $1', [shopId]);
+
+          if (rows.length) {
+            const values = [];
+            const params = [];
+            let p = 1;
+            for (const r of rows) {
+              values.push(`($${p++}, $${p++}, $${p++}, $${p++})`);
+              params.push(shopId, r.sku, r.title, r.quantity);
+            }
+
+            await pool.query(
+              `INSERT INTO shop_products (shop_id, sku, title, quantity)
+               VALUES ${values.join(',')}
+               ON CONFLICT (shop_id, sku) DO UPDATE
+                 SET title = EXCLUDED.title,
+                     quantity = EXCLUDED.quantity`,
+              params
+            );
+          }
+          await pool.query('COMMIT');
+        } catch (e) {
+          try { await pool.query('ROLLBACK'); } catch {}
+          logger.error(e, 'stocks sync after registration failed');
+        }
+
+        await replyCode(ctx, 'Вы успешно зарегистрированы! Откройте кнопку «Меню» для работы.');
+        delete regSteps[chatId];
+        return;
+      }
+
+      // нераспознанный шаг — сбросим состояние и пропустим дальше
       delete regSteps[chatId];
-      return;
+      return next();
+
+    } catch (e) {
+      try { await pool.query('ROLLBACK'); } catch {}
+      logger.error(e, 'register flow error');
+      delete regSteps[chatId];
+      await replyCode(ctx, '⚠️ Произошла ошибка при регистрации. Попробуйте /register ещё раз.');
     }
-
-    // нераспознанный шаг — сбросим состояние и пропустим дальше
-    delete regSteps[chatId];
-    return next();
-
-  } catch (e) {
-    try { await pool.query('ROLLBACK'); } catch {}
-    logger.error(e, 'register flow error');
-    delete regSteps[chatId];
-    await replyCode(ctx, '⚠️ Произошла ошибка при регистрации. Попробуйте /register ещё раз.');
-  }
-});
-}
+  });
+};
