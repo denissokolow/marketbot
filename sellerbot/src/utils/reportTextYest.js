@@ -320,6 +320,21 @@ async function getSvdHoursForDate({ client_id, api_key }, dateISO, ctx = {}) {
   return null;
 }
 
+// --- thresholds from ENV with defaults ---
+function getThresholdNum(name, def) {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) ? v : def;
+}
+const TH = {
+  drrHigh:       getThresholdNum('DRR_HIGH', 10),         // %
+  ctrLow:        getThresholdNum('CTR_LOW', 2.5),         // %
+  coinvestLow:   getThresholdNum('COINVEST_LOW', 10),     // %
+  svdHighHours:  getThresholdNum('SVD_HIGH_HOURS', 29),   // hours
+};
+
+
+
+/////////////////////////////////////////////////////////////////////////
 /**
  * Сбор текста "вчера" одним блоком (строго заданный формат).
  * @param {{client_id:string, seller_api:string, shop_name?:string}} user
@@ -334,7 +349,7 @@ async function makeYesterdaySummaryText(user, ctx = {}) {
   const client_id = user.client_id;
   const api_key   = user.seller_api;
 
-  // Заказы/выручка
+	// Заказы/выручка
   let revenue = 0, orderedUnits = 0;
   const analyticsRes = await safeCall(
     oz.getOzonReportFiltered, [0, 0],
@@ -362,59 +377,73 @@ async function makeYesterdaySummaryText(user, ctx = {}) {
     { client_id, api_key, date_from: from, date_to: to, db: ctx.db, chatId: ctx.chatId }
   );
 
-  // СВД (дни -> часы)
-const svdHours = await getSvdHoursForDate({ client_id, api_key }, date, { db: ctx.db, chatId: ctx.chatId });
+ // СВД (строго за вчера, в часах) + иконка по порогу
+const svdHours = await getSvdHoursForDate(
+  { client_id, api_key },
+  date,
+  { db: ctx.db, chatId: ctx.chatId }
+);
+const svdIcon = (svdHours != null && svdHours > TH.svdHighHours) ? '🔺' : '▫️';
 
-  // Расходы на рекламу
-  let adSpendRaw = null;
-  let adSpendText = ' -';
-  const perfCreds = ctx.db && ctx.chatId ? await getPerformanceCreds(ctx.db, ctx.chatId) : null;
-  if (perfCreds) {
-    const spend = await getAdSpendForDate(perfCreds, date);
-    if (spend != null) {
-      adSpendRaw = Number(spend) || 0;
-      adSpendText = `${fmtMoney(adSpendRaw)}₽`;
-    }
+// Расходы на рекламу (Performance API)
+let adSpendRaw = null;
+let adSpendText = ' -';
+const perfCreds = ctx.db && ctx.chatId ? await getPerformanceCreds(ctx.db, ctx.chatId) : null;
+if (perfCreds) {
+  const spend = await getAdSpendForDate(perfCreds, date);
+  if (spend != null) {
+    adSpendRaw = Number(spend) || 0;
+    adSpendText = `${fmtMoney(adSpendRaw)}₽`;
   }
+}
 
-  // ДРР = Расходы / Заказано * 100
-  const drrText = (adSpendRaw != null && revenue > 0) ? fmtPct((adSpendRaw / revenue) * 100) : ' -';
+// ДРР = (Расходы / Заказы в ₽) * 100  + иконка по порогу
+const drrVal  = (adSpendRaw != null && revenue > 0) ? (adSpendRaw / revenue) * 100 : null;
+const drrText = (drrVal != null) ? fmtPct(drrVal) : ' -';
+const drrIcon = (drrVal != null && drrVal > TH.drrHigh) ? '🔺' : '▫️';
 
-  // CTR
-  const ctrVal  = perfCreds ? await getCtrForDate(perfCreds, date) : null;
-  const ctrText = (ctrVal != null) ? fmtPct(ctrVal) : ' -';
+// CTR за вчера + иконка по порогу
+const ctrVal  = perfCreds ? await getCtrForDate(perfCreds, date) : null;
+const ctrText = (ctrVal != null) ? fmtPct(ctrVal) : ' -';
+const ctrIcon = (ctrVal != null && ctrVal < TH.ctrLow) ? '🔻' : '▫️';
 
-	// СОИНВЕСТ: средний % по отслеживаемым SKU (как в старом)
+// СОИНВЕСТ: средний % по отслеживаемым SKU (как в старом) + иконка по порогу
+let coinvestVal = null;
 let coinvestText = '—';
+let coinvestIcon = '▫️';
 if (ctx.db && ctx.chatId) {
   const trackedSkus = await getTrackedSkus(ctx.db, ctx.chatId);
   if (trackedSkus.length) {
     const avg = await fetchSoinvestAvg({ client_id, api_key, trackedSkus });
-    if (avg != null) coinvestText = `${avg}%`;
+    if (avg != null) {
+      coinvestVal  = Number(avg);
+      coinvestText = `${Math.round(coinvestVal)}%`;
+      coinvestIcon = (coinvestVal < TH.coinvestLow) ? '🔻' : '▫️';
+    }
   }
-}
+}		
 
-  // Формат — как в примере
-  const lines = [
-    `🏪 Магазин: ${user.shop_name || '—'}`,
-    ` - - - - `,
-    `📆 Общий отчёт за: ${date}`,
-    ` - - - - `,
-    `📦 Заказы: ${fmtInt(orderedUnits)} шт. на ${fmtMoney(revenue)}₽`,
-    ` - - - - `,
-    `📦 Выкуплено: ${fmtInt(buyoutStats.totalCount || 0)} шт. на ${fmtMoney(bp.buyoutAmount || buyoutStats.totalAmount || 0)}₽`,
-    ` - - - - `,
-    `📦 Возвраты: ${fmtInt(returnsCount)} шт. на ${fmtMoney(returnsSum)}₽`,
-    ` - - - - `,
-    `▫️ Расходы на рекламу:  ${adSpendText}`,
-    `▫️ Д.Р.Р:  ${drrText}`,
-    `▫️ CTR:  ${ctrText}`,
-    `▫️ Соинвест: ${coinvestText}`,
-    `🔺 СВД: ${svdHours != null ? `${svdHours} ч.` : ' -'}`,
-    ` - - - - `,
-    `💰 Прибыль: ${fmtMoney(bp.profit || 0)}₽`,
-    ` - - - - `,
-  ];
+  // --- далее формируем lines (замени только три строки метрик на версии с иконками) ---
+const lines = [
+  `🏪 Магазин: ${user.shop_name || '—'}`,
+  ` - - - - `,
+  `📆 Общий отчёт за: ${date}`,
+  ` - - - - `,
+  `📦 Заказы: ${fmtInt(orderedUnits)} шт. на ${fmtMoney(revenue)}₽`,
+  ` - - - - `,
+  `📦 Выкуплено: ${fmtInt(buyoutStats.totalCount || 0)} шт. на ${fmtMoney(bp.buyoutAmount || buyoutStats.totalAmount || 0)}₽`,
+  ` - - - - `,
+  `📦 Возвраты: ${fmtInt(returnsCount)} шт. на ${fmtMoney(returnsSum)}₽`,
+  ` - - - - `,
+  `▫️ Расходы на рекламу:  ${adSpendText}`,
+  `${drrIcon} Д.Р.Р:  ${drrText}`,
+  `${ctrIcon} CTR:  ${ctrText}`,
+  `${coinvestIcon} Соинвест: ${coinvestText}`,
+  `${svdIcon} СВД: ${svdHours != null ? `${svdHours} ч.` : ' -'}`,
+  ` - - - - `,
+  `💰 Прибыль: ${fmtMoney(bp.profit || 0)}₽`,
+  ` - - - - `,
+];
 
   return lines.map(l => `<code>${esc(l)}</code>`).join('\n');
 }
