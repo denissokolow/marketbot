@@ -64,8 +64,12 @@ async function getCampaignDailyStatsTotals({ client_id, client_secret, date }) {
 
   const url = `${BASE_URL}/api/client/statistics/daily/json?dateFrom=${date}&dateTo=${date}`;
 
+const DBG_PERF = process.env.DEBUG_PERF === '1';
+if (DBG_PERF) {
+  // показываем только хвост client_id и тип токена — сам токен не светим
   console.log('[Performance] GET', url);
-  console.log('[Performance] auth:', tokenType, token);
+  console.log('[Performance] auth:', tokenType, '(hidden)');
+}
 
   let res;
   try {
@@ -144,8 +148,12 @@ async function getPerSkuStatsFromDaily({
 
   // 1) Грузим сводку по кампаниям за период
   const url = `${BASE_URL}/api/client/statistics/daily/json?dateFrom=${date_from}&dateTo=${date_to}`;
+const DBG_PERF = process.env.DEBUG_PERF === '1';
+if (DBG_PERF) {
+  // показываем только хвост client_id и тип токена — сам токен не светим
   console.log('[Performance] GET', url);
-  console.log('[Performance] auth:', tokenType, token);
+  console.log('[Performance] auth:', tokenType, '(hidden)');
+}
 
   let res;
   try {

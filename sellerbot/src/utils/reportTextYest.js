@@ -51,6 +51,7 @@ async function getTrackedSkus(db, chatId) {
 // унифицированный запрос к Ozon — ищем доступный метод
 async function ozRequest({ client_id, api_key, endpoint, body }) {
   try {
+    const oz = require('../services/ozon');
     if (typeof oz.ozonApiRequest === 'function') {
       return await oz.ozonApiRequest({ client_id, api_key, endpoint, body });
     }
@@ -64,6 +65,42 @@ async function ozRequest({ client_id, api_key, endpoint, body }) {
   } catch (e) {
     return null;
   }
+}
+
+// /v3/finance/transaction/totals → агрегаты за день
+async function getFinanceTotals({ client_id, api_key, date_from, date_to }) {
+  const body = {
+    date: { from: date_from, to: date_to },
+    posting_number: '',
+    transaction_type: 'all',
+  };
+  const resp = await ozRequest({
+    client_id, api_key,
+    endpoint: '/v3/finance/transaction/totals',
+    body,
+  });
+  return resp?.result || null;
+}
+
+// сумма расходов из totals (берём модуль значений перечисленных полей)
+function sumExpensesFromTotals(totals) {
+  if (!totals || typeof totals !== 'object') return 0;
+  const fields = [
+    'sale_commission',
+    'processing_and_delivery',
+    'refunds_and_cancellations',
+    'services_amount',
+    'compensation_amount',
+    'money_transfer',
+    'others_amount',
+  ];
+  let s = 0;
+  for (const k of fields) {
+    const v = Number(totals[k] || 0);
+    if (!Number.isFinite(v)) continue;
+    s += Math.abs(v);
+  }
+  return Math.round(s * 100) / 100;
 }
 
 // Перфоманс-креды магазина (последний магазин пользователя) — ИМЕНА ПОЛЕЙ КАК В СХЕМЕ
@@ -367,15 +404,36 @@ async function makeYesterdaySummaryText(user, ctx = {}) {
   const returnsCount = await safeCall(oz.getReturnsCountFiltered, 0, { client_id, api_key, date });
   const returnsSum   = await safeCall(oz.getReturnsSumFiltered,   0, { client_id, api_key, date });
 
-  // Выкуп и прибыль
-  const buyoutStats = await safeCall(
-    oz.getDeliveryBuyoutStats, { totalCount: 0, totalAmount: 0 },
-    { client_id, api_key, date_from: from, date_to: to, db: ctx.db, chatId: ctx.chatId }
-  );
-  const bp = await safeCall(
-    oz.getBuyoutAndProfit, { buyoutAmount: buyoutStats.totalAmount || 0, profit: 0 },
-    { client_id, api_key, date_from: from, date_to: to, db: ctx.db, chatId: ctx.chatId }
-  );
+  // 3) Выкуп и прибыль (через finance/totals)
+const buyoutStats = await safeCall(
+  oz.getDeliveryBuyoutStats,
+  { totalCount: 0, totalAmount: 0, buyoutCost: 0 },
+  { client_id, api_key, date_from: from, date_to: to, db: ctx.db, chatId: ctx.chatId }
+);
+const buyoutCount = Number(buyoutStats?.totalCount || 0);
+
+// --- Финансы / totals за вчера ---
+const totals = await getFinanceTotals({
+  client_id, api_key, date_from: from, date_to: to
+});
+const accrualsForSale = Number(totals?.accruals_for_sale || 0);   // «выкуплено на сумму», ₽
+const expensesTotals  = sumExpensesFromTotals(totals);            // все расходы, ₽
+
+// --- Прибыль (вчера) = выкупная выручка − расходы − сумма возвратов ---
+const profitFinal = Math.round(
+  (accrualsForSale - expensesTotals - Number(returnsSum || 0)) * 100
+) / 100;
+
+// (опционально) отладка
+if (process.env.DEBUG_YEST === '1') {
+  console.log('[yesterday-finance-totals]', {
+    date, from, to,
+    returnsCount, returnsSum,
+    buyoutCount,
+    totals_raw: totals,
+    accrualsForSale, expensesTotals, profitFinal
+  });
+}
 
  // СВД (строго за вчера, в часах) + иконка по порогу
 const svdHours = await getSvdHoursForDate(
@@ -431,7 +489,7 @@ const lines = [
   ` - - - - `,
   `📦 Заказы: ${fmtInt(orderedUnits)} шт. на ${fmtMoney(revenue)}₽`,
   ` - - - - `,
-  `📦 Выкуплено: ${fmtInt(buyoutStats.totalCount || 0)} шт. на ${fmtMoney(bp.buyoutAmount || buyoutStats.totalAmount || 0)}₽`,
+  `📦 Выкуплено: ${fmtInt(buyoutCount)} шт. на ${fmtMoney(accrualsForSale)}₽`,
   ` - - - - `,
   `📦 Возвраты: ${fmtInt(returnsCount)} шт. на ${fmtMoney(returnsSum)}₽`,
   ` - - - - `,
@@ -441,7 +499,7 @@ const lines = [
   `${coinvestIcon} Соинвест: ${coinvestText}`,
   `${svdIcon} СВД: ${svdHours != null ? `${svdHours} ч.` : ' -'}`,
   ` - - - - `,
-  `💰 Прибыль: ${fmtMoney(bp.profit || 0)}₽`,
+ `💰 Прибыль: ${fmtMoney(profitFinal)}₽`,
   ` - - - - `,
 ];
 
