@@ -1,75 +1,45 @@
-// src/utils/reportLastMsku.js
-// Отчёт per-SKU за ПРОШЛЫЙ календарный месяц (как в /last30, но за прошлый месяц).
-// Экспорт:
-//   - makeLastMPerSkuText(user, { trackedSkus, db, chatId })
-//   - makeLastMTextAndData(user, { trackedSkus, db, chatId }) -> { text, items, periodLabel }
-//
-// user: { client_id, seller_api, shop_name? }
-// trackedSkus: number[]
-//
-// Требуемые поля БД:
-//   shops.perf_client_id, shops.perf_client_secret  (Performance API)
-//
-// Зависимости: services/ozon, services/performanceApi
-//
 
-const oz = require('../services/ozon');
+// sellerbot/src/utils/reportYestSku.js
+// Перечень по SKU за ВЧЕРА (одним сообщением, строго как в примере).
+// Формат на каждый SKU:
+//   📦 Название (SKU)
+//   ▫️ Заказано: X шт. на Y₽ | нет
+//   ▫️ Выкуплено: X шт. на Y₽ | нет
+//   ▫️ Возвраты: X шт. | нет
+//   ▫️ Брак (в возвратах): X шт. | нет
+//   (❗|▫️) Остаток на складе: Z шт.
+//   (❗️|▫️) Д.Р.Р.: xx,xx% | —
+//   - - - -
 
-let perf = null;
-try { perf = require('../services/performanceApi'); } catch { perf = null; }
+const { getYesterdayISO } = require('../utils/dates');
+const { getPerSkuSpendByDay } = require('../services/perfSkuSpend');
 
-// ---------- форматтеры ----------
-const esc = (s='') => String(s)
-  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-const fmtInt    = (n) => (Math.round(Number(n) || 0)).toLocaleString('ru-RU');
-const fmtMoney0 = (n) => (Math.round(Number(n) || 0)).toLocaleString('ru-RU');
-const fmtPct2   = (n) => (n == null || !isFinite(n))
-  ? null
-  : new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n) + '%';
+// ---- утилиты ----
+const esc = (s='') => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const fmtMoney = (n) => Math.round(Number(n) || 0).toLocaleString('ru-RU');
+const fmtInt   = (n) => Math.round(Number(n) || 0).toLocaleString('ru-RU');
+const fmtPct2  = (x) => (x == null || !Number.isFinite(x))
+  ? '—'
+  : new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(x) + '%';
 
-// ---------- ENV пороги (можно править без деплоя) ----------
-function getNum(name, def) {
-  const v = Number(process.env[name]);
-  return Number.isFinite(v) ? v : def;
-}
-const TH = {
-  drrHigh:  getNum('DRR_HIGH', 10),     // %
-  ctrLow:   getNum('CTR_LOW',  2.5),    // %
-  roiLow:   getNum('ROI_LOW',  0),      // %  (ниже — подсветка)
-};
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const includesBrak = (s) => typeof s === 'string' && s.toLowerCase().includes('брак');
+const firstWord = (s='') => (String(s).trim().split(/\s+/)[0] || '');
 
-// ---------- даты ----------
-function getPrevMonthRangeUTC() {
-  const now = new Date();
-  const y = now.getUTCFullYear();
-  const m = now.getUTCMonth(); // 0..11 (текущий)
-  const first = new Date(Date.UTC(y, m - 1, 1));
-  const last  = new Date(Date.UTC(y, m, 0));
-  const iso = (d) => {
-    const yy = d.getUTCFullYear();
-    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-    const dd = String(d.getUTCDate()).padStart(2, '0');
-    return `${yy}-${mm}-${dd}`;
-  };
-  return { from: iso(first), to: iso(last) };
-}
-function* daysIter(fromISO, toISO) {
-  const [fy,fm,fd] = fromISO.split('-').map(Number);
-  const [ty,tm,td] = toISO.split('-').map(Number);
-  let d = new Date(Date.UTC(fy, fm - 1, fd));
-  const end = new Date(Date.UTC(ty, tm - 1, td));
-  while (d <= end) {
-    const y = d.getUTCFullYear();
-    const m = String(d.getUTCMonth() + 1).padStart(2, '0');
-    const day = String(d.getUTCDate()).padStart(2, '0');
-    yield `${y}-${m}-${day}`;
-    d = new Date(d.getTime() + 86400_000);
-  }
+// Пороги из ENV (с дефолтами)
+const YEST_DRR_WARN_GT   = Number(process.env.YEST_DRR_WARN_GT   ?? 10); // %
+const YEST_STOCK_LOW_LE  = Number(process.env.YEST_STOCK_LOW_LE  ?? 5);  // шт.
+
+// ---- безопасные вызовы ----
+async function safeCall(fn, fallback, args) {
+  if (typeof fn !== 'function') return fallback;
+  try { return await fn(args); } catch { return fallback; }
 }
 
-// ---------- универсальный oz-request ----------
+// ---- Ozon низкоуровневый запрос (ищем доступную функцию клиента) ----
 async function ozRequest({ client_id, api_key, endpoint, body }) {
   try {
+    const oz = require('../services/ozon');
     if (typeof oz.ozonApiRequest === 'function') {
       return await oz.ozonApiRequest({ client_id, api_key, endpoint, body });
     }
@@ -81,435 +51,435 @@ async function ozRequest({ client_id, api_key, endpoint, body }) {
     }
     throw new Error('Ozon API request function not found');
   } catch (e) {
-    if (process.env.DEBUG_LASTM === '1') {
-      console.warn('[lastM] ozRequest error', endpoint, e?.response?.data || e.message);
-    }
     return null;
   }
 }
-async function safeCall(fn, fallback, args) {
-  try { return await fn(args); } catch { return fallback; }
-}
 
-// ---------- Performance creds ----------
-async function getPerformanceCreds(db, chatId) {
-  // perf_client_id / perf_client_secret  (как договорились)
-  const q = await db.query(
-    `SELECT s.perf_client_id, s.perf_client_secret
-       FROM shops s
-       JOIN users u ON u.id = s.user_id
-      WHERE u.chat_id = $1
-      ORDER BY s.created_at DESC NULLS LAST, s.id DESC
-      LIMIT 1`,
-    [chatId]
+// ---- tracked SKUs (если есть колонка tracked — фильтруем по ней) ----
+async function hasColumn(db, table, column) {
+  const { rows } = await db.query(
+    `SELECT 1 FROM information_schema.columns WHERE table_name=$1 AND column_name=$2 LIMIT 1`,
+    [table, column]
   );
-  if (!q.rowCount) return null;
-  const row = q.rows[0];
-  if (!row.perf_client_id || !row.perf_client_secret) return null;
-  return { client_id: row.perf_client_id, client_secret: row.perf_client_secret };
+  return rows.length > 0;
+}
+async function getTrackedSkus(db, chatId) {
+  const trackedExists = await hasColumn(db, 'shop_products', 'tracked');
+  const sqlBase = `
+    SELECT sp.sku::bigint AS sku
+      FROM shop_products sp
+      JOIN shops s ON s.id = sp.shop_id
+      JOIN users u ON u.id = s.user_id
+     WHERE u.chat_id = $1
+  `;
+  const sql = trackedExists ? `${sqlBase} AND sp.tracked = TRUE` : sqlBase;
+  const r = await db.query(sql, [chatId]);
+  return (r.rows || []).map(x => Number(x.sku)).filter(Number.isFinite);
 }
 
-// ---------- Перекаст рекламы per-SKU за период ----------
-async function getPerSkuSpendForRange({ client_id, client_secret, from, to, trackedSkus, allocationWeights = null }) {
-  if (!perf || typeof perf.getPerSkuStatsFromDaily !== 'function') return new Map();
-  const map = await perf.getPerSkuStatsFromDaily({
-    client_id, client_secret,
-    date_from: from, date_to: to,
-    trackedSkus,
-    allocationWeights,
-  });
-  const out = new Map();
-  for (const [sku, v] of map.entries()) {
-    const spent  = Number(v?.spent || 0);
-    const views  = Number(v?.views || 0);
-    const clicks = Number(v?.clicks || 0);
-    out.set(Number(sku), { spent, views, clicks });
+// ---- analytics per SKU (вчера) ----
+async function fetchAnalyticsSkuYesterday({ client_id, api_key, ymd }) {
+  const rows = [];
+  const limit = 1000;
+  let offset = 0;
+  while (true) {
+    const resp = await ozRequest({
+      client_id, api_key,
+      endpoint: '/v1/analytics/data',
+      body: {
+        date_from: ymd,
+        date_to:   ymd,
+        metrics:   ['revenue', 'ordered_units'],
+        dimension: ['sku'],
+        sort: [{ key: 'revenue', order: 'DESC' }],
+        limit,
+        offset,
+      },
+    });
+    const data = Array.isArray(resp?.result?.data) ? resp.result.data
+               : Array.isArray(resp?.data)        ? resp.data
+               : [];
+    rows.push(...data);
+    if (data.length < limit) break;
+    offset += data.length;
+    await sleep(50);
   }
-  return out;
+  return rows;
 }
 
-// ---------- Названия товаров по SKU ----------
-async function getNamesBySku({ client_id, api_key }, skus) {
-  const skuSet = Array.from(new Set((skus || []).map(Number).filter(Number.isFinite)));
-  if (!skuSet.length) return new Map();
+// ---- finance: операции с items за вчера (используем только с items) ----
+async function fetchFinanceOpsYesterday({ client_id, api_key, fromISO, toISO }) {
+  const out = [];
+  const page_size = 1000;
+  let page = 1;
+  while (true) {
+    const resp = await ozRequest({
+      client_id, api_key,
+      endpoint: '/v3/finance/transaction/list',
+      body: {
+        filter: {
+          date: { from: fromISO, to: toISO },
+          operation_type: [],
+          posting_number: '',
+          transaction_type: 'all',
+        },
+        page,
+        page_size,
+      },
+    });
+    const ops = Array.isArray(resp?.result?.operations) ? resp.result.operations : [];
+    out.push(...ops);
+    if (resp?.result?.has_next === true) { page += 1; await sleep(50); } else break;
+  }
+  // оставляем только операции с items
+  return out.filter(op => Array.isArray(op?.items) && op.items.length);
+}
 
-  // 1) sku -> product_id через /v4/product/info/stocks
-  const skuToPid = new Map();
+// ---- returns + брак (вчера) ----
+async function fetchReturnsYesterday({ client_id, api_key, fromISO, toISO }) {
+  const counts = new Map();     // sku -> qty
+  const brakCounts = new Map(); // sku -> qty
+  const seen = new Set();
+
+  const limit = 500;
+  let last_id = 0;
+  while (true) {
+    const resp = await ozRequest({
+      client_id, api_key,
+      endpoint: '/v1/returns/list',
+      body: {
+        filter: { logistic_return_date: { time_from: fromISO, time_to: toISO } },
+        limit, last_id,
+      },
+    });
+    const result = resp?.result || resp || {};
+    const items = Array.isArray(result?.returns) ? result.returns : [];
+    if (!items.length) break;
+
+    for (const rt of items) {
+      const sku = Number(rt?.sku ?? rt?.product?.sku ?? rt?.product_id?.sku ?? 0);
+      if (!Number.isFinite(sku)) continue;
+
+      const id  = rt?.id ?? rt?.return_id ?? rt?.acceptance_id ?? null;
+      const pn  = rt?.posting_number || rt?.posting?.posting_number || '';
+      const idx = rt?.item_index ?? rt?.item_id ?? rt?.index ?? 0;
+      const key = id != null ? `id:${id}` : `pn:${pn}|sku:${sku}|idx:${idx}`;
+      if (seen.has(key)) continue; seen.add(key);
+
+      const q = Number.isFinite(Number(rt?.quantity))
+        ? Number(rt?.quantity)
+        : Number.isFinite(Number(rt?.return_count)) ? Number(rt?.return_count)
+        : Number.isFinite(Number(rt?.qty)) ? Number(rt?.qty)
+        : 1;
+
+      counts.set(sku, (counts.get(sku) || 0) + q);
+
+      const reason = rt?.return_reason_name || rt?.reason || '';
+      if (includesBrak(reason)) brakCounts.set(sku, (brakCounts.get(sku) || 0) + q);
+    }
+
+    const next = Number(result?.last_id ?? 0);
+    if (!next || next === last_id) break;
+    last_id = next;
+    await sleep(30);
+  }
+
+  return { counts, brakCounts };
+}
+
+// ---- остатки по SKU (текущее состояние складов) ----
+async function fetchStocksMap({ client_id, api_key, skus }) {
+  const set = new Set((skus || []).map(Number).filter(Number.isFinite));
+  const map = new Map(); // sku -> qty суммарно
   let cursor = '';
-  for (let page = 0; page < 30; page++) {
-    const r = await ozRequest({
+  for (let i = 0; i < 50; i++) {
+    const resp = await ozRequest({
       client_id, api_key,
       endpoint: '/v4/product/info/stocks',
       body: { cursor, filter: { visibility: 'ALL' }, limit: 100 },
     });
-    const items = r?.result?.items || r?.items || [];
+    const items = resp?.result?.items || resp?.items || [];
     for (const it of items) {
-      const pid = Number(it?.product_id || it?.id || 0);
-      for (const st of (it?.stocks || [])) {
+      const stocks = Array.isArray(it?.stocks) ? it.stocks : [];
+      for (const st of stocks) {
         const sku = Number(st?.sku || 0);
-        if (skuSet.includes(sku) && pid) skuToPid.set(sku, pid);
+        if (!Number.isFinite(sku) || (set.size && !set.has(sku))) continue;
+        const qty = Number(
+          st?.present ?? st?.free_to_sell ?? st?.sellable ?? st?.stock ?? st?.balance ?? 0
+        );
+        map.set(sku, (map.get(sku) || 0) + (Number.isFinite(qty) ? qty : 0));
       }
     }
-    const next = r?.result?.cursor ?? r?.cursor ?? '';
+    const next = resp?.result?.cursor ?? resp?.cursor ?? '';
     cursor = typeof next === 'string' ? next : '';
     if (!cursor) break;
-    if (skuToPid.size >= skuSet.length) break;
+    await sleep(50);
   }
-  const pids = Array.from(new Set([...skuToPid.values()].filter(Number.isFinite)));
-  if (!pids.length) return new Map();
+  return map;
+}
 
-  // 2) /v3/product/info/list по product_id -> name
-  const names = new Map();
-  for (let i = 0; i < pids.length; i += 100) {
-    const part = pids.slice(i, i + 100).map(String);
-    const r = await ozRequest({
-      client_id, api_key,
-      endpoint: '/v3/product/info/list',
-      body: { product_id: part },
+// Перфоманс-креды магазина (универсально под обе схемы колонок)
+async function getPerformanceCreds(db, chatId) {
+  // проверяем, какие колонки есть
+  const hasPerfId      = await hasColumn(db, 'shops', 'perf_client_id');
+  const hasPerfSecret  = await hasColumn(db, 'shops', 'perf_client_secret');
+  const hasOldId       = await hasColumn(db, 'shops', 'performance_client_id');
+  const hasOldSecret   = await hasColumn(db, 'shops', 'performance_secret');
+
+  const colId     = hasPerfId ? 'perf_client_id' : (hasOldId ? 'performance_client_id' : null);
+  const colSecret = hasPerfSecret ? 'perf_client_secret' : (hasOldSecret ? 'performance_secret' : null);
+
+  if (!colId || !colSecret) return null;
+
+  const q = await db.query(
+    `
+    SELECT s.${colId}     AS client_id,
+           s.${colSecret} AS client_secret
+      FROM shops s
+      JOIN users u ON u.id = s.user_id
+     WHERE u.chat_id = $1
+     ORDER BY s.created_at DESC NULLS LAST, s.id DESC
+     LIMIT 1
+    `,
+    [chatId]
+  );
+  if (!q.rowCount) return null;
+
+  const row = q.rows[0];
+  if (!row.client_id || !row.client_secret) return null;
+  return { client_id: row.client_id, client_secret: row.client_secret };
+}
+
+async function getAdSpendPerSkuYesterday({ db, chatId, trackedSkus, fromYmd, toYmd }) {
+  try {
+    const perf = require('../services/performanceApi');
+    if (typeof perf?.getPerSkuStatsFromDaily !== 'function') return new Map();
+    const creds = await getPerformanceCreds(db, chatId);
+    if (!creds) return new Map();
+    return await perf.getPerSkuStatsFromDaily({
+      client_id: creds.client_id,
+      client_secret: creds.client_secret,
+      date_from: fromYmd,
+      date_to:   toYmd,
+      trackedSkus,
+      allocationWeights: Object.fromEntries(trackedSkus.map(sku => [sku, 1])),
     });
-    const resItems = r?.result?.items || r?.items || [];
-    for (const it of resItems) {
-      const pid = Number(it?.id || it?.product_id || 0);
-      const name = String(it?.name || it?.title || '').trim();
-      if (!pid || !name) continue;
-      for (const [sku, p] of skuToPid.entries()) {
-        if (p === pid) names.set(sku, name);
-      }
-    }
+  } catch {
+    return new Map();
   }
-  return names; // Map<sku, name>
 }
 
-// ---------- Аналитика per-SKU за период (заказы/выручка) ----------
-async function getOrderedAndRevenueBySku({ client_id, api_key }, fromISO, toISO, trackedSkus) {
-  const out = new Map(); // sku -> { ordered: n, revenue: ₽ }
-  const tracked = new Set((trackedSkus || []).map(Number).filter(Number.isFinite));
+// ---- главный рендер ----
+async function makeYesterdayPerSkuText(user, { db = null, chatId = null } = {}) {
+  const ymd = getYesterdayISO();
+  const fromISO = `${ymd}T00:00:00.000Z`;
+  const toISO   = `${ymd}T23:59:59.999Z`;
 
-  const body = {
-    dimension: ['sku'],
-    metrics: ['ordered_units', 'revenue'],
-    filters: [
-      { key: 'date_from', value: fromISO },
-      { key: 'date_to',   value: toISO },
-    ],
-    limit: 1000,
+  // 1) tracked
+  const tracked = (db && chatId) ? await getTrackedSkus(db, chatId) : [];
+  if (!tracked.length) {
+    return `<code>📆 Отчёт по товарам за: ${ymd}</code>\n<code> - - - - </code>\n<code>Нет отслеживаемых товаров.</code>`;
+  }
+  const trackedSet = new Set(tracked);
+
+  // 2) analytics по SKU за вчера
+  const analyticsRows = await fetchAnalyticsSkuYesterday({
+    client_id: user.client_id,
+    api_key:   user.seller_api,
+    ymd,
+  });
+  const orderedMap = new Map(); // sku -> { ordered, revenue }
+  const nameBySku  = new Map();
+  for (const row of analyticsRows) {
+    const dim = row?.dimensions?.[0];
+    const sku = Number(dim?.id);
+    if (!Number.isFinite(sku) || !trackedSet.has(sku)) continue;
+    const m = Array.isArray(row?.metrics) ? row.metrics : [0, 0];
+    orderedMap.set(sku, { revenue: Number(m[0]||0), ordered: Number(m[1]||0) });
+    const nm = String(dim?.name || '').trim();
+    if (nm) nameBySku.set(sku, nm);
+  }
+
+  // 3) финоперации с items за вчера → выкуплено шт./₽
+  const ops = await fetchFinanceOpsYesterday({
+    client_id: user.client_id,
+    api_key:   user.seller_api,
+    fromISO, toISO,
+  });
+
+  const agg = new Map(); // sku -> { grossAccrPos, posCnt, negCnt }
+  const ensure = (sku) => {
+    let v = agg.get(sku);
+    if (!v) { v = { grossAccrPos:0, posCnt:0, negCnt:0 }; agg.set(sku, v); }
+    return v;
   };
 
-  const r = await ozRequest({
-    client_id, api_key,
-    endpoint: '/v1/analytics/data',
-    body,
-  });
-
-  const rows = r?.result?.data || r?.data || r?.result || [];
-  for (const row of rows) {
-    const sku = Number(row?.sku || row?.SKU || row?.dimension?.sku || 0);
-    if (!Number.isFinite(sku)) continue;
-    if (tracked.size && !tracked.has(sku)) continue;
-    const ordered = Number(row?.ordered_units ?? row?.ordered ?? row?.orders ?? 0);
-    const revenue = Number(row?.revenue ?? row?.gmv ?? 0);
-    const cur = out.get(sku) || { ordered: 0, revenue: 0 };
-    cur.ordered += ordered;
-    cur.revenue += revenue;
-    out.set(sku, cur);
+  // распределение по весам (quantity в пределах одной операции)
+  function splitByWeights(total, weightsMap) {
+    let totalW = 0; weightsMap.forEach(w => totalW += w);
+    if (totalW <= 0) return new Map();
+    const res = new Map();
+    weightsMap.forEach((w, sku) => { res.set(sku, (total * w) / totalW); });
+    return res;
   }
 
-  return out;
-}
-
-// ---------- Выкуп/доставляется per-SKU через postings FBS ----------
-async function getDeliveredAndDeliveringBySku({ client_id, api_key }, fromISO, toISO, trackedSkus) {
-  const tracked = new Set((trackedSkus || []).map(Number).filter(Number.isFinite));
-  const res = {
-    delivered: new Map(),   // sku -> { qty, amount }
-    delivering: new Map(),  // sku -> qty
-  };
-
-  async function scan(status, collector) {
-    let last_id = '';
-    for (let page = 0; page < 100; page++) {
-      const r = await ozRequest({
-        client_id, api_key,
-        endpoint: '/v3/posting/fbs/list',
-        body: {
-          filter: {
-            status, since: `${fromISO}T00:00:00.000Z`, to: `${toISO}T23:59:59.999Z`,
-          },
-          limit: 100,
-          last_id,
-          with: { analytics_data: true, financial_data: true },
-        },
-      });
-      const postings = r?.result?.postings || r?.postings || [];
-      for (const p of postings) {
-        const prods = p?.products || [];
-        for (const pr of prods) {
-          const sku = Number(pr?.sku || 0);
-          if (!Number.isFinite(sku)) continue;
-          if (tracked.size && !tracked.has(sku)) continue;
-          const qty = Number(pr?.quantity || pr?.qty || 0);
-          const amount = Number(pr?.price || pr?.sale_amount || pr?.sum || 0);
-          collector(sku, qty, amount);
-        }
-      }
-      const next = r?.result?.last_id ?? r?.last_id ?? '';
-      if (!next || next === last_id) break;
-      last_id = next;
+  for (const op of ops) {
+    const items = Array.isArray(op?.items) ? op.items : [];
+    const weights = new Map();
+    for (const it of items) {
+      const sku = Number(it?.sku || 0);
+      if (!Number.isFinite(sku) || !trackedSet.has(sku)) continue;
+      const q = Number(it?.quantity || 1);
+      weights.set(sku, (weights.get(sku) || 0) + (Number.isFinite(q) ? q : 1));
+      if (!nameBySku.has(sku) && it?.name) nameBySku.set(sku, String(it.name));
     }
-  }
+    if (weights.size === 0) continue;
 
-  await scan('delivered', (sku, qty, amount) => {
-    const cur = res.delivered.get(sku) || { qty: 0, amount: 0 };
-    cur.qty    += qty;
-    cur.amount += amount;
-    res.delivered.set(sku, cur);
-  });
+    const accr = Number(op?.accruals_for_sale || 0);
+    const accrPos = accr > 0 ? accr : 0;
+    const accrPosParts = splitByWeights(accrPos, weights);
 
-  await scan('delivering', (sku, qty) => {
-    const cur = res.delivering.get(sku) || { qty: 0 };
-    cur.qty += qty;
-    res.delivering.set(sku, cur);
-  });
-
-  return res;
-}
-
-// ---------- Возвраты/брак per-SKU (best-effort) ----------
-async function getReturnsBySku({ client_id, api_key }, fromISO, toISO, trackedSkus) {
-  const tracked = new Set((trackedSkus || []).map(Number).filter(Number.isFinite));
-  const returns = new Map(); // sku -> qty
-  const defects = new Map(); // sku -> qty (брак в возвратах)
-
-  // Попытка: /v2/returns/company/fbs (если доступно)
-  const r = await ozRequest({
-    client_id, api_key,
-    endpoint: '/v2/returns/company/fbs',
-    body: {
-      filter: { since: `${fromISO}T00:00:00.000Z`, to: `${toISO}T23:59:59.999Z` },
-      limit: 1000,
-      offset: 0,
-    },
-  });
-
-  const arr = r?.result?.returns || r?.returns || [];
-  for (const it of arr) {
-    const sku = Number(it?.sku || it?.product?.sku || 0);
-    if (!Number.isFinite(sku)) continue;
-    if (tracked.size && !tracked.has(sku)) continue;
-    const isDefect = Boolean(it?.is_bad || it?.is_defect || it?.defect);
-    const cur = returns.get(sku) || 0;
-    returns.set(sku, cur + 1);
-    if (isDefect) defects.set(sku, (defects.get(sku) || 0) + 1);
-  }
-
-  return { returns, defects };
-}
-
-// ---------- ABC-классификация по выручке ----------
-function abcClassify(items) {
-  const sorted = [...items].sort((a,b) => (b.revenue||0)-(a.revenue||0));
-  const total = sorted.reduce((s,x)=>s+(Number(x.revenue)||0),0);
-  let acc = 0;
-  for (const it of sorted) {
-    const share = total > 0 ? (it.revenue / total) * 100 : 0;
-    acc += share;
-    if (acc <= 80) it.abc = 'A';
-    else if (acc <= 95) it.abc = 'B';
-    else it.abc = 'C';
-  }
-}
-
-// ---------- Сбор per-SKU данных ----------
-async function buildLastMData(user, { trackedSkus, db, chatId }) {
-  const { from, to } = getPrevMonthRangeUTC();
-  const skus = Array.from(new Set((trackedSkus||[]).map(Number).filter(Number.isFinite)));
-  if (!skus.length) return { periodLabel: `${from} → ${to}`, items: [] };
-
-  const credsPerf = db && chatId ? await getPerformanceCreds(db, chatId) : null;
-
-  // 1) Заказано/выручка (analytics)
-  const ordMap = await getOrderedAndRevenueBySku(
-    { client_id: user.client_id, api_key: user.seller_api },
-    from, to, skus
-  );
-
-  // 2) Выкуп/доставляется (postings FBS)
-  const post = await getDeliveredAndDeliveringBySku(
-    { client_id: user.client_id, api_key: user.seller_api },
-    from, to, skus
-  );
-
-  // 3) Возвраты/брак (best-effort)
-  const ret = await getReturnsBySku(
-    { client_id: user.client_id, api_key: user.seller_api },
-    from, to, skus
-  );
-
-  // 4) Реклама per-SKU (Perf)
-  let ppc = new Map();
-  if (credsPerf && perf && typeof perf.getPerSkuStatsFromDaily === 'function') {
-    try {
-      ppc = await getPerSkuSpendForRange({
-        client_id: credsPerf.client_id,
-        client_secret: credsPerf.client_secret,
-        from, to,
-        trackedSkus: skus,
-        allocationWeights: null,
-      });
-    } catch (e) {
-      if (process.env.DEBUG_LASTM === '1') {
-        console.warn('[lastM] perf per-sku error', e?.response?.data || e.message);
-      }
-    }
-  }
-
-  // 5) Названия
-  const nameMap = await getNamesBySku({ client_id: user.client_id, api_key: user.seller_api }, skus);
-
-  // 6) Сбор per-SKU
-  const items = [];
-  for (const sku of skus) {
-    const ord = ordMap.get(sku) || { ordered: 0, revenue: 0 };
-    const del = post.delivered.get(sku) || { qty: 0, amount: 0 };
-    const ship = post.delivering.get(sku) || { qty: 0 };
-    const retQty = (ret.returns.get(sku) || 0);
-    const badQty = (ret.defects.get(sku) || 0);
-    const p = ppc.get(sku) || { spent: 0, views: 0, clicks: 0 };
-
-    items.push({
-      sku,
-      title: nameMap.get(sku) || '',
-      ordered: Number(ord.ordered || 0),
-      revenue: Number(ord.revenue || 0),
-      deliveredQty: Number(del.qty || 0),
-      deliveredAmount: Number(del.amount || 0),
-      deliveringQty: Number(ship.qty || 0),
-      returnsQty: Number(retQty || 0),
-      defectQty: Number(badQty || 0),
-      ad_spend: Number(p.spent || 0),
-      views: Number(p.views || 0),
-      clicks: Number(p.clicks || 0),
+    weights.forEach((w, sku) => {
+      const slot = ensure(sku);
+      slot.grossAccrPos += (accrPosParts.get(sku) || 0);
+      if (accr > 0) slot.posCnt += w;
+      else if (accr < 0) slot.negCnt += w;
     });
   }
 
-  // 7) Производные метрики: DRR, CTR, profit/roi, buyoutRate
-  for (const it of items) {
-    it.drr = (it.revenue > 0 && it.ad_spend > 0) ? (it.ad_spend / it.revenue) * 100 : null;
-    it.ctr = (it.views > 0 && it.clicks >= 0) ? (it.clicks / it.views) * 100 : null;
+  // 4) возвраты/брак
+  const { counts: returnsMap, brakCounts: brakMap } = await fetchReturnsYesterday({
+    client_id: user.client_id,
+    api_key:   user.seller_api,
+    fromISO, toISO,
+  });
 
-    // Прибыль за период (best-effort): deliveredAmount - ad_spend
-    const profitAfterAds = Number.isFinite(it.deliveredAmount)
-      ? (it.deliveredAmount - (it.ad_spend || 0))
-      : null;
-    it.profit = profitAfterAds;
+  // 5) остатки (текущие)
+  const stocksMap = await fetchStocksMap({
+    client_id: user.client_id,
+    api_key:   user.seller_api,
+    skus: tracked,
+  });
 
-    // Прибыль на шт.
-    it.ppu = (it.deliveredQty > 0 && Number.isFinite(profitAfterAds))
-      ? (profitAfterAds / it.deliveredQty)
-      : null;
+// 6) реклама per SKU за вчера (через Performance API — токен берём в services/performanceApi.js)
+let ppcBySku = new Map();
+let totalPpcSpend = 0; // <— ДОБАВИЛИ
 
-    // ROI = profit / ad_spend * 100
-    it.roi = (it.ad_spend > 0 && Number.isFinite(profitAfterAds))
-      ? (profitAfterAds / it.ad_spend) * 100
-      : null;
+try {
+  const creds = await getPerformanceCreds(db, chatId);
+  if (creds) {
+    const { getPerSkuSpendByDay } = require('../services/perfSkuSpend');
 
-    // Процент выкупа: deliveredQty / (ordered - deliveringQty)
-    const denom = (it.ordered - it.deliveringQty);
-    it.buyoutRate = (denom > 0 && it.deliveredQty >= 0)
-      ? (it.deliveredQty / denom) * 100
-      : null;
+    const trackedList =
+      (typeof trackedSkus !== 'undefined' && Array.isArray(trackedSkus) && trackedSkus.length) ? trackedSkus :
+      (typeof tracked !== 'undefined' && Array.isArray(tracked) && tracked.length)               ? tracked :
+      (typeof trackedSet !== 'undefined' && trackedSet && typeof trackedSet.values === 'function') ? Array.from(trackedSet) :
+      [];
+
+    let allocationWeights = null;
+    if (process.env.YEST_DRR_ALLOC_WEIGHTS === 'orders' && typeof orderedMap !== 'undefined') {
+      allocationWeights = {};
+      for (const [sku, ord] of orderedMap) {
+        allocationWeights[Number(sku)] = Number(ord?.revenue || 0);
+      }
+    }
+
+    const { map, meta } = await getPerSkuSpendByDay({
+      date: ymd,
+      perfCreds: { client_id: creds.client_id, client_secret: creds.client_secret },
+      trackedSkus: trackedList,
+      allocationWeights,
+    });
+
+    ppcBySku = map;
+    totalPpcSpend = Number(meta?.total_spend || 0); // <— ДОБАВИЛИ
+
+    if (process.env.DEBUG_YEST_PER_SKU === '1') {
+      console.log('[perf-per-sku:daily]', meta);
+    }
+  } else if (process.env.DEBUG_YEST_PER_SKU === '1') {
+    console.log('[perf-per-sku] no performance creds for chat', chatId);
   }
-
-  // 8) ABC по выручке
-  abcClassify(items);
-
-  return { periodLabel: `${from} → ${to}`, items };
+} catch (e) {
+  console.warn('[yesterday per-sku] perf spend error:', e?.response?.data || e.message);
 }
 
-// ---------- Рендер текста ----------
-function firstWord(s='') {
-  const t = String(s).trim();
-  if (!t) return '';
-  const m = t.match(/^[^,|–—-]+/);
-  return (m ? m[0] : t).trim();
-}
-
-function drrIcon(val) {
-  if (val == null || !isFinite(val)) return '▫️';
-  return val > TH.drrHigh ? '🔺' : '▫️';
-}
-function ctrIcon(val) {
-  if (val == null || !isFinite(val)) return '▫️';
-  return val < TH.ctrLow ? '🔻' : '▫️';
-}
-function roiIcon(val) {
-  if (val == null || !isFinite(val)) return '▫️';
-  return val < TH.roiLow ? '🔻' : '▫️';
-}
-function profitIcon(val) {
-  if (val == null || !isFinite(val)) return '▫️';
-  return val < 0 ? '🔻' : '▫️';
-}
-
-function qtyMoneyLine(qty, money) {
-  if (!Number(qty)) return 'нет';
-  return `${fmtInt(qty)} шт. на ${fmtMoney0(money)}₽`;
-}
-function qtyLine(qty) {
-  if (!Number(qty)) return 'нет';
-  return `${fmtInt(qty)} шт.`;
-}
-
-function buildText(shopName, periodLabel, items) {
+  // 7) вывод
   const lines = [];
-  lines.push(`<code>🏪 Магазин: ${esc(shopName || '—')}</code>`);
-  lines.push('<code> - - - - </code>');
-  lines.push(`<code>📆 Период: ${esc(periodLabel)}</code>`);
+  lines.push(`<code>📆 Отчёт по товарам за: ${ymd}</code>`);
   lines.push('<code> - - - - </code>');
 
-  for (const it of items) {
-    const title = firstWord(it.title) || `SKU ${it.sku}`;
+  // сортировка: по выкупной сумме desc, затем по SKU
+  const orderSkus = [...tracked].sort((a, b) => {
+    const ra = Number(agg.get(a)?.grossAccrPos || 0);
+    const rb = Number(agg.get(b)?.grossAccrPos || 0);
+    if (rb !== ra) return rb - ra;
+    return a - b;
+  });
 
-    const drrStr = it.drr != null ? fmtPct2(it.drr) : '—';
-    const ctrStr = it.ctr != null ? fmtPct2(it.ctr) : '—';
-    const roiStr = it.roi != null ? fmtPct2(it.roi) : '—';
-    const ppuStr = (it.ppu != null && isFinite(it.ppu)) ? `${fmtMoney0(it.ppu)}₽` : '—';
-    const buyoutStr = it.buyoutRate != null ? fmtPct2(it.buyoutRate) : '—';
+  const qtyLine = (n) => Number(n) ? `${fmtInt(n)} шт.` : 'нет';
+  const qtyMoneyLine = (qty, sum) =>
+    Number(qty) ? `${fmtInt(qty)} шт. на ${fmtMoney(sum)}₽` : 'нет';
 
-    lines.push(`<code>📦 ${esc(title)} (${it.sku})</code>`);
-    lines.push(`<code>▫️ Заказано: ${qtyMoneyLine(it.ordered, it.revenue)}</code>`);
-    lines.push(`<code>▫️ Выкуплено: ${qtyMoneyLine(it.deliveredQty, it.deliveredAmount)}</code>`);
-    lines.push(`<code>▫️ Доставляется: ${fmtInt(it.deliveringQty)} шт.</code>`);
-    lines.push(`<code>▫️ Возвраты: ${qtyLine(it.returnsQty)}</code>`);
-    lines.push(`<code>▫️ Брак (в возвратах): ${it.defectQty ? qtyLine(it.defectQty) : 'нет'}</code>`);
-    lines.push(`<code>▫️ Процент выкупа: ${buyoutStr}</code>`);
-    lines.push(`<code>${drrIcon(it.drr)} Д.Р.Р: ${drrStr}</code>`);
-    lines.push(`<code>${ctrIcon(it.ctr)} CTR: ${ctrStr}</code>`);
-    lines.push(`<code>▫️ Расходы: ${Number(it.ad_spend) ? `${fmtMoney0(it.ad_spend)}₽` : 'нет'}</code>`);
-    lines.push(`<code>${profitIcon(it.profit)} Прибыль: ${Number.isFinite(it.profit) ? `${fmtMoney0(it.profit)}₽` : 'нет'}</code>`);
-    lines.push(`<code>${profitIcon(it.ppu)} Прибыль на шт.: ${ppuStr}</code>`);
-    lines.push(`<code>${roiIcon(it.roi)} ROI: ${roiStr}</code>`);
-    lines.push(`<code>▫️ ABC: ${it.abc || '—'}</code>`);
-    lines.push('<code> - - - - </code>');
+  for (const sku of orderSkus) {
+    const ord = orderedMap.get(sku) || { ordered:0, revenue:0 };
+    const a   = agg.get(sku)       || { grossAccrPos:0, posCnt:0, negCnt:0 };
+    const netCnt   = Math.max(0, Number(a.posCnt || 0) - Number(a.negCnt || 0));
+    const grossRev = Number(a.grossAccrPos || 0);
+    const returnsQty = Number(returnsMap.get(sku) || 0);
+    const brakQty    = Number(brakMap.get(sku)    || 0);
+    const stockQty   = Number(stocksMap.get(sku)  || 0);
+
+// ===== ДРР по SKU =====
+let drrStr  = '—';
+let drrIcon = '▫️';
+
+const adSpend = Number(ppcBySku.get(sku) ?? 0);
+const denom   = Number(ord?.revenue ?? 0); // "Заказано на сумму" по SKU — ЧИСЛО!
+
+if (adSpend > 0 && denom > 0) {
+  // обычный ДРР: spend / orderedRevenue
+  const drrVal = (adSpend / denom) * 100;
+  drrStr = new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+              .format(drrVal) + '%';
+  const warnGt = Number(process.env.YEST_DRR_WARN_GT || process.env.DRR_HIGH || 10);
+  drrIcon = (drrVal > warnGt) ? '🔺' : '▫️';
+} else if (adSpend > 0 && denom <= 0) {
+  // доля этого SKU от общего рекламного расхода за день
+  const sharePct = totalPpcSpend > 0 ? (adSpend / totalPpcSpend) * 100 : null;
+  const pctStr = (sharePct != null)
+    ? new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(sharePct) + '%'
+    : '—';
+
+  // итого получим: "❗ Д.Р.Р.: 2,46% (45₽), заказов нет"
+  drrStr  = `${pctStr} (${fmtMoney(adSpend)}₽), заказов нет`;
+  drrIcon = '❗';
+
+  if (process.env.DEBUG_YEST_PER_SKU === '1') {
+    console.log('[yest-sku-DRR:no-orders]', { sku, adSpend, totalPpcSpend, sharePct });
+  }
+} else {
+  if (process.env.DEBUG_YEST_PER_SKU === '1') {
+    console.log('[yest-sku-DRR:skip]', { sku, adSpend, revenue: denom });
+  }
+}
+
+// ---- формирование блока товара (всё в одном месте, без дубликатов) ----
+const stockIcon = (stockQty <= YEST_STOCK_LOW_LE) ? '❗️' : '▫️';
+const titleApi  = nameBySku.get(sku) || '';
+const display   = firstWord(titleApi) || `SKU ${sku}`;
+
+lines.push(`<code>📦 ${esc(display)} (${sku})</code>`);
+lines.push(`<code>▫️ Заказано: ${qtyMoneyLine(ord.ordered, ord.revenue)}</code>`);
+lines.push(`<code>▫️ Выкуплено: ${qtyMoneyLine(netCnt, grossRev)}</code>`);
+lines.push(`<code>▫️ Возвраты: ${qtyLine(returnsQty)}</code>`);
+lines.push(`<code>▫️ Брак (в возвратах): ${qtyLine(brakQty)}</code>`);
+lines.push(`<code>${stockIcon} Остаток на складе: ${fmtInt(stockQty)} шт.</code>`);
+lines.push(`<code>${drrIcon} Д.Р.Р.: ${drrStr}</code>`);
+lines.push('<code> - - - - </code>');
   }
 
   return lines.join('\n');
 }
 
-// ---------- Публичные функции ----------
-async function makeLastMPerSkuText(user, { trackedSkus, db, chatId }) {
-  const { periodLabel, items } = await buildLastMData(user, { trackedSkus, db, chatId });
-  // ABC-классы уже проставлены в buildLastMData
-  return buildText(user.shop_name || '', periodLabel, items);
-}
-
-async function makeLastMTextAndData(user, { trackedSkus, db, chatId }) {
-  const { periodLabel, items } = await buildLastMData(user, { trackedSkus, db, chatId });
-  const text = buildText(user.shop_name || '', periodLabel, items);
-  return { text, items, periodLabel };
-}
-
-module.exports = {
-  makeLastMPerSkuText,
-  makeLastMTextAndData,
-};
+module.exports = { makeYesterdayPerSkuText };
