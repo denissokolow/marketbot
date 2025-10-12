@@ -1,106 +1,146 @@
 // src/charts/lastM.js
-// Рисуем 2 картинки для /lastM через QuickChart (без нативных либ):
-//   - Топ-N выручка по SKU (bar)
-//   - Затраты vs Прибыль по SKU (bar, может быть отрицательная прибыль)
+'use strict';
 
 const QuickChart = require('quickchart-js');
 
-// аккуратный срез названия до «первого серьёзного разделителя»
-function firstWord(s='') {
+/** Helpers */
+const firstWord = (s = '') => {
   const t = String(s).trim();
   if (!t) return '';
   const m = t.match(/^[^,|–—-]+/);
   return (m ? m[0] : t).trim();
+};
+const fmtMoney0 = (n) => Math.round(Number(n) || 0).toLocaleString('ru-RU');
+
+/** Размер полотна и отступы */
+const CANVAS_W = 1500;
+const CANVAS_H = 1000;
+const PAD_LEFT = 24;
+const PAD_BOTTOM = 24;
+// делаем область графика ≈ 1/3 полотна по ширине
+const CHART_AREA_W = Math.round(CANVAS_W / 3);
+const PAD_RIGHT = Math.max(0, CANVAS_W - PAD_LEFT - CHART_AREA_W); // ~ 1500 - 24 - 500 = 976
+const PAD_TOP = 16;
+
+/** Tableau 10 palette (НЕ МЕНЯТЬ) */
+const PALETTE = [
+  '#4e79a7', // blue
+  '#f28e2b', // orange
+  '#e15759', // red
+  '#76b7b2', // teal
+  '#59a14f', // green
+  '#edc948', // yellow
+  '#b07aa1', // purple
+  '#ff9da7', // pink
+  '#9c755f', // brown
+  '#bab0ab', // gray
+];
+
+/**
+ * Данные для доната: топ-10 SKU по прибыли (>0)
+ * Легенда берёт текст из labels => "Название (SKU) — 95 763₽"
+ */
+function buildDonutTop10(items) {
+  const norm = (items || [])
+    .map((it) => ({
+      sku: String(it.sku ?? '').trim(),
+      title: String(it.title ?? '').trim(),
+      profit: Number(it.profit ?? 0),
+    }))
+    .filter((x) => x.sku && x.title && Number.isFinite(x.profit))
+    .sort((a, b) => b.profit - a.profit)
+    .filter((x) => x.profit > 0)
+    .slice(0, 10);
+
+  const labels = norm.map((x) =>
+    `${firstWord(x.title)} (${x.sku}) — ${fmtMoney0(x.profit)}₽`
+  );
+  const data = norm.map((x) => x.profit);
+  const colors = norm.map((_, i) => PALETTE[i % PALETTE.length]);
+
+  return { labels, data, colors };
 }
 
-function labelForItem(it) {
-  const base = firstWord(it.title) || `SKU ${it.sku}`;
-  return `${base} (${it.sku})`;
-}
+/**
+ * Рендер: полотно 1500x1000, слева область графика ≈ 1/3 ширины.
+ * Порядок сверху вниз: Заголовок, Легенда, Бублик.
+ * В сообщении НИЧЕГО не выводим (никаких подписей/капшенов).
+ * @param {{ bot:any, chatId:number|string, items:Array }} params
+ */
+async function sendLastMCharts({ bot, chatId, items }) {
+  const { labels, data, colors } = buildDonutTop10(items || []);
 
-function topN(items, field, n) {
-  return [...items].sort((a,b) => (Number(b[field]||0)-Number(a[field]||0))).slice(0, n);
-}
+  if (!data.length) {
+    await bot.sendMessage(chatId, 'Нет данных для построения диаграммы (прибыль не найдена).');
+    return;
+  }
 
-async function sendChart({ bot, chatId, config, caption, width=1000, height=600, bg='white' }) {
   const qc = new QuickChart();
+  qc.setWidth(CANVAS_W);
+  qc.setHeight(CANVAS_H);
+  qc.setBackgroundColor('white');
+  qc.setFormat('png');
+  if (typeof qc.setVersion === 'function') qc.setVersion('4'); // Chart.js v4
+
+  const config = {
+    type: 'doughnut',
+    data: {
+      labels,
+      datasets: [{
+        data,
+        backgroundColor: colors,
+        borderColor: 'white',
+        borderWidth: 2,
+        hoverOffset: 2,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      // Область графика сужаем до 1/3 полотна за счёт правого паддинга
+      layout: { padding: { top: PAD_TOP, right: PAD_RIGHT, bottom: PAD_BOTTOM, left: PAD_LEFT } },
+      cutout: '62%',
+      plugins: {
+        // Заголовок (над легендой)
+        title: {
+          display: true,
+          text: 'Топ-10 SKU по прибыли',
+          align: 'start',
+          padding: { top: 4, bottom: 8 },
+          font: { size: 24, weight: '600' },
+          color: '#111',
+        },
+        // Встроенная легенда (над бубликом)
+        legend: {
+          display: true,
+          position: 'top',
+          align: 'start',
+          labels: {
+            boxWidth: 14,
+            boxHeight: 14,
+            padding: 12,
+            font: { size: 16 },
+            color: '#222',
+          },
+        },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => `${fmtMoney0(Number(ctx.parsed) || 0)}₽`,
+          },
+        },
+        datalabels: { display: false }, // никаких подписей на сегментах
+      },
+    },
+  };
+
   qc.setConfig(config);
-  qc.setWidth(width);
-  qc.setHeight(height);
-  qc.setBackgroundColor(bg);
+  const bin = await qc.toBinary();
 
-  // Можно qc.getUrl(), но короче — shortUrl
-  const url = await qc.getShortUrl();
-  await bot.sendPhoto(chatId, { url }, { caption, parse_mode: 'HTML' });
-}
-
-async function sendLastMCharts({ bot, chatId, items, period }) {
-  if (!Array.isArray(items) || items.length === 0) return;
-
-  const N = Number(process.env.LASTM_CHART_TOPN || 10);
-
-  // 1) Топ-N по выручке
-  const topRevenue = topN(items, 'revenue', N);
-  const labels1 = topRevenue.map(labelForItem);
-  const revenueData = topRevenue.map(x => Math.round(Number(x.revenue||0)));
-  const spendData   = topRevenue.map(x => Math.round(Number(x.ad_spend||0)));
-
-  const chart1 = {
-    type: 'bar',
-    data: {
-      labels: labels1,
-      datasets: [
-        { label: 'Выручка', data: revenueData },
-        { label: 'Расходы (реклама)', data: spendData },
-      ],
-    },
-    options: {
-      responsive: true,
-      plugins: {
-        legend: { position: 'top' },
-        title: {
-          display: true,
-          text: `Топ-${labels1.length} по выручке • ${period}`,
-        },
-      },
-      scales: {
-        x: { ticks: { maxRotation: 60, minRotation: 0 } },
-        y: { beginAtZero: true },
-      },
-    },
-  };
-
-  await sendChart({ bot, chatId, config: chart1 });
-
-  // 2) Затраты vs Прибыль (по тем же SKU)
-  const profitData = topRevenue.map(x => Math.round(Number(x.profit || 0)));
-
-  const chart2 = {
-    type: 'bar',
-    data: {
-      labels: labels1,
-      datasets: [
-        { label: 'Расходы (реклама)', data: spendData },
-        { label: 'Прибыль', data: profitData },
-      ],
-    },
-    options: {
-      responsive: true,
-      plugins: {
-        legend: { position: 'top' },
-        title: {
-          display: true,
-          text: `Затраты vs Прибыль • ${period}`,
-        },
-      },
-      scales: {
-        x: { ticks: { maxRotation: 60, minRotation: 0 } },
-        y: { beginAtZero: true },
-      },
-    },
-  };
-
-  await sendChart({ bot, chatId, config: chart2 });
+  // Отправляем БЕЗ подписи/текста
+  await bot.sendPhoto(
+    chatId,
+    { source: bin, filename: `profit_donut_${Date.now()}.png` }
+  );
 }
 
 module.exports = { sendLastMCharts };

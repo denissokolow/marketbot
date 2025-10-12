@@ -5,6 +5,26 @@
 const oz = require('../services/ozon');
 const perfApi = require('../services/performanceApi');
 
+// ---- DB safety ----
+const DB_QUERY_TIMEOUT_MS = Number(process.env.DB_QUERY_TIMEOUT_MS || 4000);
+const LASTM_DISABLE_DB_COSTS = process.env.LASTM_DISABLE_DB_COSTS === '1';
+
+async function dbQuerySafe(db, sql, params = [], label = 'db') {
+  if (!db) return null;
+  try {
+    const q = db.query(sql, params);
+    const t = new Promise((_, rej) =>
+      setTimeout(() => rej(new Error('db-timeout')), DB_QUERY_TIMEOUT_MS)
+    );
+    return await Promise.race([q, t]);
+  } catch (e) {
+    if (process.env.DEBUG_LASTM === '1') {
+      console.warn(`[lastM][${label}]`, e?.message || e);
+    }
+    return null;
+  }
+}
+
 // ---------- совместимость вызова Ozon API ----------
 async function ozonApiRequestCompat({ client_id, api_key, endpoint, body }) {
   if (typeof oz.ozonApiRequest === 'function') {
@@ -116,44 +136,70 @@ function abcBadge(cls) {
 }
 
 // ---------- себестоимость per-unit из БД ----------
+let _hasTrackedColCache = null;
 async function hasColumn(db, table, column) {
-  const r = await db.query(
-    `SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2 LIMIT 1`,
-    [table, column]
+  if (!db) return false;
+
+  if (table === 'shop_products' && column === 'tracked' && _hasTrackedColCache != null) {
+    return _hasTrackedColCache;
+  }
+
+  const r = await dbQuerySafe(
+    db,
+    `SELECT 1
+       FROM information_schema.columns
+      WHERE table_schema='public' AND table_name=$1 AND column_name=$2
+      LIMIT 1`,
+    [table, column],
+    'hasColumn'
   );
-  return r.rowCount > 0;
+
+  const ok = !!(r && r.rowCount);
+  if (table === 'shop_products' && column === 'tracked') _hasTrackedColCache = ok;
+  return ok;
 }
 async function getCostsMapForTracked(db, chatId, trackedSkus) {
-  if (!db || !chatId) return new Map();
-  const skus = (Array.isArray(trackedSkus) ? trackedSkus : [])
-    .map(Number).filter(Number.isFinite);
-  if (!skus.length) return new Map();
+  try {
+    if (LASTM_DISABLE_DB_COSTS) return new Map();
+    if (!db || !chatId) return new Map();
 
-  const trackedExists = await hasColumn(db, 'shop_products', 'tracked');
-  const sql = trackedExists
-    ? `
-      SELECT sp.sku::bigint AS sku, COALESCE(sp.net, 0)::numeric AS net
-        FROM shop_products sp
-        JOIN shops s ON s.id = sp.shop_id
-        JOIN users u ON u.id = s.user_id
-       WHERE u.chat_id = $1
-         AND sp.tracked = TRUE
-         AND sp.sku = ANY($2::bigint[])`
-    : `
-      SELECT sp.sku::bigint AS sku, COALESCE(sp.net, 0)::numeric AS net
-        FROM shop_products sp
-        JOIN shops s ON s.id = sp.shop_id
-        JOIN users u ON u.id = s.user_id
-       WHERE u.chat_id = $1
-         AND sp.sku = ANY($2::bigint[])`;
+    const skus = (Array.isArray(trackedSkus) ? trackedSkus : [])
+      .map(Number).filter(Number.isFinite);
+    if (!skus.length) return new Map();
 
-  const r = await db.query(sql, [chatId, skus]);
-  const map = new Map();
-  for (const row of (r.rows || [])) {
-    const sku = Number(row.sku);
-    if (Number.isFinite(sku)) map.set(sku, Number(row.net) || 0);
+    const trackedExists = await hasColumn(db, 'shop_products', 'tracked');
+    const sql = trackedExists
+      ? `
+        SELECT sp.sku::bigint AS sku, COALESCE(sp.net, 0)::numeric AS net
+          FROM shop_products sp
+          JOIN shops s ON s.id = sp.shop_id
+          JOIN users u ON u.id = s.user_id
+         WHERE u.chat_id = $1
+           AND sp.tracked = TRUE
+           AND sp.sku = ANY($2::bigint[])`
+      : `
+        SELECT sp.sku::bigint AS sku, COALESCE(sp.net, 0)::numeric AS net
+          FROM shop_products sp
+          JOIN shops s ON s.id = sp.shop_id
+          JOIN users u ON u.id = s.user_id
+         WHERE u.chat_id = $1
+           AND sp.sku = ANY($2::bigint[])`;
+
+    const r = await dbQuerySafe(db, sql, [chatId, skus], 'getCosts');
+    const map = new Map();
+    if (!r || !r.rows) return map;
+
+    for (const row of r.rows) {
+      const sku = Number(row.sku);
+      if (Number.isFinite(sku)) map.set(sku, Number(row.net) || 0);
+    }
+    return map;
+  } catch (e) {
+    if (process.env.DEBUG_LASTM === '1') {
+      console.warn('[lastM] costsMap fallback (DB error)', e?.message || e);
+    }
+    return new Map();
   }
-  return map;
 }
 
 // ---------- analytics: заказано/выручка по SKU ----------
@@ -539,7 +585,7 @@ async function makeLastMPerSkuText(user, { trackedSkus = [], db = null, chatId =
   for (const sku of orderSkus) {
     const ord = orderedMap.get(sku) || { ordered:0, revenue:0 };
     const a   = agg.get(sku)       || { grossAccrPos:0, posCnt:0, negCnt:0, expenses:0 };
-    const net = Number((await getCostsMapForTracked(db, chatId, [sku])).get(sku) || 0);
+    const net = Number(costsMap.get(sku) || 0);
 
     const posCnt   = Math.max(0, a.posCnt);
     const negCnt   = Math.max(0, a.negCnt);
