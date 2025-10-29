@@ -1,7 +1,7 @@
 // src/commands/settings.js
 const { Markup } = require('telegraf');
+const { syncStocksForUser } = require('../services/ozon/syncStocks');
 
-// ===== helpers =====
 const esc = (s = '') => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 const replyCode = (ctx, text, extra = {}) =>
   ctx.reply(`<code>${esc(String(text))}</code>`, { parse_mode: 'HTML', ...extra });
@@ -18,7 +18,6 @@ const fmtDate = (d) => {
 };
 const fmtRUB0 = (n) => Math.round(Number(n)||0).toLocaleString('ru-RU');
 
-// ===== callbacks & paging =====
 const CB = {
   MAIN:       'settings:main',
   PROFILE:    'settings:profile',
@@ -28,10 +27,8 @@ const CB = {
 };
 const PAGE_SIZE = 10;
 
-// Состояние ожидания ввода себестоимости: by chatId
 const costInputState = new Map(); // { shopId, sku, page }
 
-// ===== data access (минимум SQL) =====
 async function getUserByChat(pool, chatId) {
   const r = await pool.query('SELECT * FROM users WHERE chat_id=$1 LIMIT 1', [chatId]);
   return r.rows[0] || null;
@@ -78,7 +75,6 @@ async function setNet(pool, shopId, sku, net) {
   );
 }
 
-// ===== UI text =====
 const rootText = () => '⚙️ Настройки';
 function profileText({ firstName, lastName, shopName, isSubscribed, untilText }) {
   const name = [firstName||'', lastName||''].filter(Boolean).join(' ').trim() || '—';
@@ -126,16 +122,18 @@ function costsKeyboard(shopId, page, totalPages, items) {
   return Markup.inlineKeyboard(rows);
 }
 
-// ====== main module ======
 function settings(bot, { pool, logger }) {
+  const L = {
+    info:  (logger?.info  || console.log).bind(logger || console),
+    warn:  (logger?.warn  || console.warn).bind(logger || console),
+    error: (logger?.error || console.error).bind(logger || console),
+  };
 
-  // /settings — корень
   bot.command('settings', async (ctx) => {
     try { await sendOrEdit(ctx, rootText(), mainKeyboard()); }
-    catch (e) { logger?.error?.(e, '/settings error'); }
+    catch (e) { L.error(e, '/settings error'); }
   });
 
-  // Навигация
   bot.action(CB.MAIN, async (ctx) => { try { await ctx.answerCbQuery(); } catch {} ; await sendOrEdit(ctx, rootText(), mainKeyboard()); });
 
   bot.action(CB.PROFILE, async (ctx) => {
@@ -153,7 +151,7 @@ function settings(bot, { pool, logger }) {
       });
       await sendOrEdit(ctx, text, profileKeyboard());
     } catch (e) {
-      logger?.error?.(e, 'settings:profile error');
+      L.error('settings:profile error', e);
       await replyCode(ctx, 'Произошла ошибка. Попробуйте позже.');
     }
   });
@@ -165,25 +163,48 @@ function settings(bot, { pool, logger }) {
     await sendOrEdit(ctx, `🏪 Магазин: ${shop.name || '—'}`, shopKeyboard(shop.id));
   });
 
-  // Список товаров с остатком > 0 (себестоимость)
+  // Список товаров с остатком > 0
   bot.action(new RegExp(`^${CB.COSTS}:(\\d+)$`), async (ctx) => {
     try { await ctx.answerCbQuery(); } catch {}
     const page = Math.max(1, Number(ctx.match[1] || 1));
     const shop = await getUsersShop(pool, ctx.from.id);
-    if (!shop) return sendOrEdit(ctx, 'Магазин не найден.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Назад', CB.MAIN)]]));
+    if (!shop) {
+      return sendOrEdit(
+        ctx,
+        'Магазин не найден.',
+        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Назад', CB.MAIN)]]),
+      );
+    }
+
+    // 1) синк остатков
+    try {
+      const syncRes = await syncStocksForUser(pool, ctx.from.id, logger);
+      if (process.env.DEBUG_STOCKS === '1') {
+        L.info('[settings] sync result', syncRes);
+      }
+    } catch (e) {
+      L.warn('[settings] syncStocksForUser failed', e?.message || e);
+    }
+
+    // 2) выборка из БД
     const { items, total } = await getProductsPage(pool, shop.id, page, PAGE_SIZE);
+    if (process.env.DEBUG_STOCKS === '1') {
+      L.info('[settings] products page', { page, total, sample: items.slice(0, 5) });
+    }
+
     if (!total) {
       return sendOrEdit(
         ctx,
         'В этом магазине пока нет товаров с положительным остатком.',
-        Markup.inlineKeyboard([[Markup.button.callback('◀️ Назад', CB.SHOP)]])
+        Markup.inlineKeyboard([[Markup.button.callback('◀️ Назад', CB.SHOP)]]),
       );
     }
+
     const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
     await sendOrEdit(ctx, '💵 Себестоимость товаров (остаток > 0):', costsKeyboard(shop.id, page, totalPages, items));
   });
 
-  // Выбор позиции для ввода net
+  // Выбор позиции
   bot.action(new RegExp(`^${CB.COST_SET}:(\\d+):(\\d+)$`), async (ctx) => {
     try { await ctx.answerCbQuery(); } catch {}
     const sku  = Number(ctx.match[1]);
@@ -194,11 +215,11 @@ function settings(bot, { pool, logger }) {
     await sendOrEdit(
       ctx,
       `Введите себестоимость для SKU ${sku} (число, можно с запятой).`,
-      Markup.inlineKeyboard([[Markup.button.callback('◀️ Назад', `${CB.COSTS}:${page}`)]])
+      Markup.inlineKeyboard([[Markup.button.callback('◀️ Назад', `${CB.COSTS}:${page}`)]]),
     );
   });
 
-  // Текстовый ввод net
+  // Ввод net
   bot.on('text', async (ctx, next) => {
     const st = costInputState.get(ctx.from.id);
     if (!st) return next();
@@ -219,7 +240,6 @@ function settings(bot, { pool, logger }) {
       costInputState.delete(ctx.from.id);
     }
 
-    // перерисуем текущую страницу
     const { items, total } = await getProductsPage(pool, st.shopId, st.page, PAGE_SIZE);
     const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
     await sendOrEdit(ctx, '💵 Себестоимость товаров (остаток > 0):', costsKeyboard(st.shopId, st.page, totalPages, items));

@@ -1,5 +1,6 @@
 // Универсальная выборка остатков через /v1/analytics/turnover/stocks
 // Пейджит по limit/offset, собирает все items
+//services/ozon/stoks.js
 const { request } = require('./client');
 
 async function fetchAllTurnoverStocks(creds, { limit = 500, offset = 0, maxPages = 200 } = {}) {

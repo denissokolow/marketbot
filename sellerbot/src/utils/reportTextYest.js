@@ -1,6 +1,6 @@
 // sellerbot/src/utils/reportTextYest.js
 // Единая точка формирования "общего отчёта за вчера" (одним сообщением)
-// Формат — как в старом. Есть: Заказы/Выручка, Выкуп/Прибыль, Возвраты,
+// Формат — как в старом. Есть: Заказы/Выручка, Выкуп/Маржа, Возвраты, Отмены,
 // Расходы на рекламу (Performance API), ДРР, CTR, СВД.
 
 const oz = require('../services/ozon');
@@ -18,6 +18,14 @@ const fmtInt   = (n) => (Math.round(Number(n) || 0)).toLocaleString('ru-RU');
 const fmtPct   = (n) => (n == null || !isFinite(n))
   ? null
   : new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n) + '%';
+
+// единый вывод строки с "шт. и ₽" или "нет"
+function lineCountRub(label, count, sum) {
+  const c = Number(count) || 0;
+  const s = Number(sum)   || 0;
+  if (c === 0 && s === 0) return `${label}: нет`;
+  return `${label}: ${fmtInt(c)} шт. на ${fmtMoney(s)}₽`;
+}
 
 async function safeCall(fn, fallback, args) {
   if (typeof fn !== 'function') return fallback;
@@ -82,11 +90,11 @@ async function getFinanceTotals({ client_id, api_key, date_from, date_to }) {
   return resp?.result || null;
 }
 
-// сумма расходов из totals (берём модуль значений перечисленных полей)
-function sumExpensesFromTotals(totals) {
+// Сумма «расходов» БЕЗ sale_commission (как в /report)
+function sumExpensesFromTotalsExCommission(totals) {
   if (!totals || typeof totals !== 'object') return 0;
   const fields = [
-    'sale_commission',
+    // 'sale_commission',   // исключаем
     'processing_and_delivery',
     'refunds_and_cancellations',
     'services_amount',
@@ -101,6 +109,197 @@ function sumExpensesFromTotals(totals) {
     s += Math.abs(v);
   }
   return Math.round(s * 100) / 100;
+}
+
+// ===== себестоимости из БД (как в /report) =====
+async function getCostsMapFromDB(db, chatId) {
+  try {
+    if (!db || !chatId) return new Map();
+    const sql = `
+      SELECT sp.sku::bigint AS sku, COALESCE(sp.net, 0)::numeric AS net
+        FROM shop_products sp
+        JOIN shops s  ON s.id = sp.shop_id
+        JOIN users u  ON u.id = s.user_id
+       WHERE u.chat_id = $1
+    `;
+    const r = await db.query(sql, [chatId]);
+    const map = new Map();
+    for (const row of (r.rows || [])) {
+      const sku = Number(row.sku);
+      const net = Number(row.net) || 0;
+      if (Number.isFinite(sku)) map.set(sku, net);
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+function normalizeSkuFilter(trackedSkus) {
+  if (!trackedSkus) return null;
+  if (Array.isArray(trackedSkus)) return trackedSkus.map(Number).filter(Number.isFinite);
+  if (typeof trackedSkus === 'string') {
+    return trackedSkus.split(/[,\s]+/).map(Number).filter(Number.isFinite);
+  }
+  if (typeof trackedSkus === 'number') return [trackedSkus];
+  return null;
+}
+
+// ===== выкупы из /v3/finance/transaction/list (как в /report, берём amount>0) =====
+async function getBuyoutsFromList({
+  client_id, api_key, date_from, date_to, trackedSkus = null, db = null, chatId = null,
+}) {
+  let count = 0;
+  let amount = 0;     // ₽
+  let buyoutCost = 0; // ₽ себестоимость
+
+  const skuFilterArray = normalizeSkuFilter(trackedSkus);
+  const skuFilter = skuFilterArray ? new Set(skuFilterArray) : null;
+
+  const costsMap = await getCostsMapFromDB(db, chatId); // sku -> net
+
+  const itemMatchesFilter = (items) => {
+    if (!skuFilter) return true;
+    if (!Array.isArray(items) || !items.length) return false;
+    for (const it of items) {
+      const skuNum = Number(it?.sku);
+      if (skuFilter.has(skuNum)) return true;
+    }
+    return false;
+  };
+
+  let page = 1;
+  const page_size = 1000;
+
+  while (true) {
+    const data = await ozRequest({
+      client_id, api_key, endpoint: '/v3/finance/transaction/list',
+      body: {
+        filter: {
+          date: { from: date_from, to: date_to },
+          operation_type: [],
+          posting_number: '',
+          transaction_type: 'all',
+        },
+        page, page_size,
+      },
+    });
+
+    const ops = data?.result?.operations || [];
+    if (!ops.length) break;
+
+    for (const op of ops) {
+      if (op?.type !== 'orders' || op?.operation_type_name !== 'Доставка покупателю') continue;
+
+      const items = Array.isArray(op?.items) ? op.items : [];
+      if (!itemMatchesFilter(items)) continue;
+
+      const amt = Number(op?.amount ?? 0); // важно: берём amount (как в /report)
+      if (amt > 0) {
+        count += 1;
+        amount += amt;
+        // себестоимость — по всем позициям
+        for (const it of items) {
+          const skuNum = Number(it?.sku) || 0;
+          if (!skuNum) continue;
+          if (skuFilter && !skuFilter.has(skuNum)) continue;
+          const net = Number(costsMap.get(skuNum) || 0);
+          if (Number.isFinite(net)) buyoutCost += net;
+        }
+      }
+    }
+
+    if (ops.length < page_size) break;
+    page += 1;
+  }
+
+  return { count, amount, buyoutCost };
+}
+
+// ===== Возвраты/Отмены из /v1/returns/list (как в /report) =====
+// форма body: { filter: { logistic_return_date: { time_from, time_to } }, limit: 500, last_id }
+function isoToSecondZ(iso) {
+  if (!iso) return iso;
+  const i = iso.indexOf('.');
+  const base = i > 0 ? iso.slice(0, i) : iso.replace(/Z?$/, '');
+  return `${base}Z`;
+}
+async function getReturnsAndCancellations({
+  client_id, api_key, date_from, date_to, trackedSkus = null,
+}) {
+  const time_from = isoToSecondZ(date_from); // YYYY-MM-DDTHH:MM:SSZ
+  const time_to   = isoToSecondZ(date_to);   // YYYY-MM-DDTHH:MM:SSZ
+
+  const trackedSet = Array.isArray(trackedSkus) && trackedSkus.length
+    ? new Set(trackedSkus.map(Number))
+    : null;
+
+  let cancelCount = 0, cancelSum = 0;
+  let returnCount = 0, returnSum = 0;
+
+  const limit = 500;
+  let last_id = 0;
+
+  const amountFromProduct = (pr = {}) => {
+    const q = Number(pr?.quantity || 0) || 1;
+    const noComm = Number(pr?.price_without_commission?.price || 0);
+    const raw    = Number(pr?.price?.price || 0);
+    const unit   = noComm > 0 ? noComm : raw;
+    return (Number.isFinite(unit) ? unit : 0) * q;
+  };
+  const qtyFromProduct = (pr = {}) => {
+    const q = Number(pr?.quantity || 0);
+    return Number.isFinite(q) && q > 0 ? q : 1;
+  };
+  const passesSkuFilter = (pr = {}) => {
+    if (!trackedSet) return true;
+    const sku = Number(pr?.sku || pr?.product_id || 0);
+    return trackedSet.has(sku);
+  };
+
+  for (let page = 1; page <= 500; page++) {
+    const body = {
+      filter: { logistic_return_date: { time_from, time_to } },
+      limit,
+      last_id,
+    };
+
+    const data = await ozRequest({
+      client_id, api_key, endpoint: '/v1/returns/list', body,
+    });
+
+    const list = Array.isArray(data?.returns) ? data.returns : [];
+    if (!list.length) break;
+
+    for (const ret of list) {
+      const t = String(ret?.type || '').trim();
+      const pr = ret?.product || {};
+      if (!passesSkuFilter(pr)) continue;
+
+      const amt = amountFromProduct(pr);
+      const qty = qtyFromProduct(pr);
+
+      if (t === 'ClientReturn') {
+        returnCount += qty;
+        returnSum   += amt;
+      } else if (t === 'Cancellation') {
+        cancelCount += qty;
+        cancelSum   += amt;
+      }
+
+      // курсор last_id — берём максимальный
+      if (typeof ret?.id === 'number' && ret.id > last_id) last_id = ret.id;
+    }
+
+    const hasNext = Boolean(data?.has_next);
+    if (!hasNext) break;
+  }
+
+  return {
+    returnsCount: Math.round(returnCount),
+    returnsSum: Math.round(returnSum * 100) / 100,
+    cancelsCount: Math.round(cancelCount),
+    cancelsSum: Math.round(cancelSum * 100) / 100,
+  };
 }
 
 // Перфоманс-креды магазина (последний магазин пользователя) — ИМЕНА ПОЛЕЙ КАК В СХЕМЕ
@@ -221,7 +420,7 @@ async function getCtrForDate(creds, dateISO) {
   return null;
 }
 
-// Соинвест (средний % по отслеживаемым SKU): v4 stocks -> v5 prices
+// СОИНВЕСТ: средний % по отслеживаемым SKU
 async function fetchSoinvestAvg({ client_id, api_key, trackedSkus }) {
   if (!Array.isArray(trackedSkus) || !trackedSkus.length) return null;
   const trackedSet = new Set(trackedSkus.map(Number).filter(Number.isFinite));
@@ -229,7 +428,7 @@ async function fetchSoinvestAvg({ client_id, api_key, trackedSkus }) {
   // 1) sku -> product_id
   const skuToPid = new Map();
   let cursor = '';
-  for (let i = 0; i < 50; i++) { // безопасная отсечка по страницам
+  for (let i = 0; i < 50; i++) {
     const resp = await ozRequest({
       client_id, api_key,
       endpoint: '/v4/product/info/stocks',
@@ -255,7 +454,7 @@ async function fetchSoinvestAvg({ client_id, api_key, trackedSkus }) {
   const productIds = Array.from(new Set([...skuToPid.values()])).filter(Number.isFinite);
   if (!productIds.length) return null;
 
-  // 2) цены по product_id (чанками)
+  // 2) цены по product_id
   const pcts = [];
   for (let i = 0; i < productIds.length; i += 100) {
     const part = productIds.slice(i, i + 100).map(String);
@@ -271,7 +470,7 @@ async function fetchSoinvestAvg({ client_id, api_key, trackedSkus }) {
         const mp  = Number(it?.price?.marketing_price ?? 0);
         const msp = Number(it?.price?.marketing_seller_price ?? 0);
         if (msp > 0 && mp > 0 && mp <= msp) {
-          const pct = (1 - mp / msp) * 100; // доля снижения от цены продавца
+          const pct = (1 - mp / msp) * 100;
           if (Number.isFinite(pct)) pcts.push(pct);
         }
       }
@@ -282,10 +481,10 @@ async function fetchSoinvestAvg({ client_id, api_key, trackedSkus }) {
 
   if (!pcts.length) return null;
   const avg = pcts.reduce((a, b) => a + b, 0) / pcts.length;
-  return Math.round(avg); // как в старом — целое число процентов
+  return Math.round(avg);
 }
 
-// СВД за дату (в часах) с нормализацией: если число < 24 — это дни; иначе — часы.
+// СВД за дату (в часах)
 async function getSvdHoursForDate({ client_id, api_key }, dateISO, ctx = {}) {
   const from = `${dateISO}T00:00:00.000Z`;
   const to   = `${dateISO}T23:59:59.999Z`;
@@ -293,11 +492,10 @@ async function getSvdHoursForDate({ client_id, api_key }, dateISO, ctx = {}) {
   const asHours = (v) => {
     const x = Number(v);
     if (!Number.isFinite(x)) return null;
-    // ключевое правило: маленькие значения (<24) считаем днями, большие — уже часы
     return Math.round(x < 24 ? x * 24 : x);
   };
 
-  // Вариант A: getAverageDeliveryTimeDays — пробуем с диапазоном
+  // Вариант A
   if (typeof oz.getAverageDeliveryTimeDays === 'function') {
     const r = await safeCall(
       oz.getAverageDeliveryTimeDays,
@@ -306,21 +504,17 @@ async function getSvdHoursForDate({ client_id, api_key }, dateISO, ctx = {}) {
     );
 
     if (r != null) {
-      // числовой ответ
       if (typeof r === 'number') {
         const h = asHours(r);
         if (h != null) return h;
       }
-      // объект — пробуем разные поля
       if (typeof r === 'object') {
-        // сначала поля с часами
         const h =
           asHours(r.avgDeliveryHours) ??
           asHours(r.avg_hours) ??
           asHours(r.avgHours);
         if (h != null) return h;
 
-        // затем поля с днями (сконвертим, но только если <24)
         const d =
           asHours(r.avgDeliveryDays) ??
           asHours(r.avg_days) ??
@@ -330,7 +524,7 @@ async function getSvdHoursForDate({ client_id, api_key }, dateISO, ctx = {}) {
     }
   }
 
-  // Вариант B: из getDeliveryBuyoutStats за тот же диапазон
+  // Вариант B
   if (typeof oz.getDeliveryBuyoutStats === 'function') {
     const st = await safeCall(
       oz.getDeliveryBuyoutStats,
@@ -353,7 +547,6 @@ async function getSvdHoursForDate({ client_id, api_key }, dateISO, ctx = {}) {
     }
   }
 
-  // Ничего подходящего
   return null;
 }
 
@@ -369,14 +562,10 @@ const TH = {
   svdHighHours:  getThresholdNum('SVD_HIGH_HOURS', 29),   // hours
 };
 
-
-
 /////////////////////////////////////////////////////////////////////////
 /**
- * Сбор текста "вчера" одним блоком (строго заданный формат).
- * @param {{client_id:string, seller_api:string, shop_name?:string}} user
- * @param {{db?:any, chatId?:number}} [ctx]
- * @returns {Promise<string>} HTML-текст (каждая строка в <code>..</code>)
+ * Сбор текста "вчера" одним блоком.
+ * API/логика выкупа, возвратов и маржи — как в /report.
  */
 async function makeYesterdaySummaryText(user, ctx = {}) {
   const date = getYesterdayISO();                 // YYYY-MM-DD (Europe/Moscow)
@@ -386,7 +575,7 @@ async function makeYesterdaySummaryText(user, ctx = {}) {
   const client_id = user.client_id;
   const api_key   = user.seller_api;
 
-	// Заказы/выручка
+  // Заказы/выручка (как было)
   let revenue = 0, orderedUnits = 0;
   const analyticsRes = await safeCall(
     oz.getOzonReportFiltered, [0, 0],
@@ -400,108 +589,112 @@ async function makeYesterdaySummaryText(user, ctx = {}) {
     orderedUnits = Number(analyticsRes.ordered_units || 0);
   }
 
-  // Возвраты
-  const returnsCount = await safeCall(oz.getReturnsCountFiltered, 0, { client_id, api_key, date });
-  const returnsSum   = await safeCall(oz.getReturnsSumFiltered,   0, { client_id, api_key, date });
-
-  // 3) Выкуп и прибыль (через finance/totals)
-const buyoutStats = await safeCall(
-  oz.getDeliveryBuyoutStats,
-  { totalCount: 0, totalAmount: 0, buyoutCost: 0 },
-  { client_id, api_key, date_from: from, date_to: to, db: ctx.db, chatId: ctx.chatId }
-);
-const buyoutCount = Number(buyoutStats?.totalCount || 0);
-
-// --- Финансы / totals за вчера ---
-const totals = await getFinanceTotals({
-  client_id, api_key, date_from: from, date_to: to
-});
-const accrualsForSale = Number(totals?.accruals_for_sale || 0);   // «выкуплено на сумму», ₽
-const expensesTotals  = sumExpensesFromTotals(totals);            // все расходы, ₽
-
-// --- Прибыль (вчера) = выкупная выручка − расходы − сумма возвратов ---
-const profitFinal = Math.round(
-  (accrualsForSale - expensesTotals - Number(returnsSum || 0)) * 100
-) / 100;
-
-// (опционально) отладка
-if (process.env.DEBUG_YEST === '1') {
-  console.log('[yesterday-finance-totals]', {
-    date, from, to,
-    returnsCount, returnsSum,
-    buyoutCount,
-    totals_raw: totals,
-    accrualsForSale, expensesTotals, profitFinal
+  // Возвраты и Отмены — как в /report, через /v1/returns/list
+  const rcn = await getReturnsAndCancellations({
+    client_id, api_key, date_from: from, date_to: to
   });
-}
+  const returnsCount = Number(rcn?.returnsCount || 0);
+  const returnsSum   = Number(rcn?.returnsSum   || 0);
+  const cancelsCount = Number(rcn?.cancelsCount || 0);
+  const cancelsSum   = Number(rcn?.cancelsSum   || 0);
 
- // СВД (строго за вчера, в часах) + иконка по порогу
-const svdHours = await getSvdHoursForDate(
-  { client_id, api_key },
-  date,
-  { db: ctx.db, chatId: ctx.chatId }
-);
-const svdIcon = (svdHours != null && svdHours > TH.svdHighHours) ? '🔺' : '▫️';
+  // Выкуп (шт. и ₽) + себестоимость — как в /report, через /v3/finance/transaction/list
+  const buy = await getBuyoutsFromList({
+    client_id, api_key, date_from: from, date_to: to, db: ctx.db, chatId: ctx.chatId
+  });
+  const buyoutCount  = Number(buy?.count || 0);
+  const buyoutAmount = Number(buy?.amount || 0);
+  const buyoutCost   = Number(buy?.buyoutCost || 0);
 
-// Расходы на рекламу (Performance API)
-let adSpendRaw = null;
-let adSpendText = ' -';
-const perfCreds = ctx.db && ctx.chatId ? await getPerformanceCreds(ctx.db, ctx.chatId) : null;
-if (perfCreds) {
-  const spend = await getAdSpendForDate(perfCreds, date);
-  if (spend != null) {
-    adSpendRaw = Number(spend) || 0;
-    adSpendText = `${fmtMoney(adSpendRaw)}₽`;
+  // Финансовая часть (totals) — только РАСХОДЫ БЕЗ sale_commission (как в /report)
+  const totals = await getFinanceTotals({ client_id, api_key, date_from: from, date_to: to });
+  const expenses = sumExpensesFromTotalsExCommission(totals);
+
+  // Маржа (как в /report):
+  // margin = buyoutAmount − expenses(excl sale_commission) − returnsSum(ClientReturn) − buyoutCost
+  const margin = Math.round((buyoutAmount - expenses - returnsSum - buyoutCost) * 100) / 100;
+
+  // (опционально) отладка
+  if (process.env.DEBUG_YEST === '1') {
+    console.log('[yesterday-summary]', {
+      date, from, to,
+      orderedUnits, revenue,
+      returnsCount, returnsSum,
+      cancelsCount, cancelsSum,
+      buyoutCount, buyoutAmount, buyoutCost,
+      totals_raw: totals,
+      expenses_excl_sale_commission: expenses,
+      margin,
+    });
   }
-}
 
-// ДРР = (Расходы / Заказы в ₽) * 100  + иконка по порогу
-const drrVal  = (adSpendRaw != null && revenue > 0) ? (adSpendRaw / revenue) * 100 : null;
-const drrText = (drrVal != null) ? fmtPct(drrVal) : ' -';
-const drrIcon = (drrVal != null && drrVal > TH.drrHigh) ? '🔺' : '▫️';
+  // СВД (в часах) + иконка по порогу
+  const svdHours = await getSvdHoursForDate(
+    { client_id, api_key }, date, { db: ctx.db, chatId: ctx.chatId }
+  );
+  const svdIcon = (svdHours != null && svdHours > TH.svdHighHours) ? '🔺' : '▫️';
 
-// CTR за вчера + иконка по порогу
-const ctrVal  = perfCreds ? await getCtrForDate(perfCreds, date) : null;
-const ctrText = (ctrVal != null) ? fmtPct(ctrVal) : ' -';
-const ctrIcon = (ctrVal != null && ctrVal < TH.ctrLow) ? '🔻' : '▫️';
-
-// СОИНВЕСТ: средний % по отслеживаемым SKU (как в старом) + иконка по порогу
-let coinvestVal = null;
-let coinvestText = '—';
-let coinvestIcon = '▫️';
-if (ctx.db && ctx.chatId) {
-  const trackedSkus = await getTrackedSkus(ctx.db, ctx.chatId);
-  if (trackedSkus.length) {
-    const avg = await fetchSoinvestAvg({ client_id, api_key, trackedSkus });
-    if (avg != null) {
-      coinvestVal  = Number(avg);
-      coinvestText = `${Math.round(coinvestVal)}%`;
-      coinvestIcon = (coinvestVal < TH.coinvestLow) ? '🔻' : '▫️';
+  // Расходы на рекламу (Performance API)
+  let adSpendRaw = null;
+  let adSpendText = ' -';
+  const perfCreds = ctx.db && ctx.chatId ? await getPerformanceCreds(ctx.db, ctx.chatId) : null;
+  if (perfCreds) {
+    const spend = await getAdSpendForDate(perfCreds, date);
+    if (spend != null) {
+      adSpendRaw = Number(spend) || 0;
+      adSpendText = `${fmtMoney(adSpendRaw)}₽`;
     }
   }
-}		
 
-  // --- далее формируем lines (замени только три строки метрик на версии с иконками) ---
-const lines = [
-  `🏪 Магазин: ${user.shop_name || '—'}`,
-  ` - - - - `,
-  `📆 Общий отчёт за: ${date}`,
-  ` - - - - `,
-  `📦 Заказы: ${fmtInt(orderedUnits)} шт. на ${fmtMoney(revenue)}₽`,
-  ` - - - - `,
-  `📦 Выкуплено: ${fmtInt(buyoutCount)} шт. на ${fmtMoney(accrualsForSale)}₽`,
-  ` - - - - `,
-  `📦 Возвраты: ${fmtInt(returnsCount)} шт. на ${fmtMoney(returnsSum)}₽`,
-  ` - - - - `,
-  `▫️ Расходы на рекламу:  ${adSpendText}`,
-  `${drrIcon} Д.Р.Р:  ${drrText}`,
-  `${ctrIcon} CTR:  ${ctrText}`,
-  `${coinvestIcon} Соинвест: ${coinvestText}`,
-  `${svdIcon} СВД: ${svdHours != null ? `${svdHours} ч.` : ' -'}`,
-  ` - - - - `,
- `💰 Прибыль: ${fmtMoney(profitFinal)}₽`,
-  ` - - - - `,
-];
+  // ДРР
+  const drrVal  = (adSpendRaw != null && revenue > 0) ? (adSpendRaw / revenue) * 100 : null;
+  const drrText = (drrVal != null) ? fmtPct(drrVal) : ' -';
+  const drrIcon = (drrVal != null && drrVal > TH.drrHigh) ? '🔺' : '▫️';
+
+  // CTR
+  const ctrVal  = perfCreds ? await getCtrForDate(perfCreds, date) : null;
+  const ctrText = (ctrVal != null) ? fmtPct(ctrVal) : ' -';
+  const ctrIcon = (ctrVal != null && ctrVal < TH.ctrLow) ? '🔻' : '▫️';
+
+  // СОИНВЕСТ
+  let coinvestVal = null;
+  let coinvestText = '—';
+  let coinvestIcon = '▫️';
+  if (ctx.db && ctx.chatId) {
+    const trackedSkus = await getTrackedSkus(ctx.db, ctx.chatId);
+    if (trackedSkus.length) {
+      const avg = await fetchSoinvestAvg({ client_id, api_key, trackedSkus });
+      if (avg != null) {
+        coinvestVal  = Number(avg);
+        coinvestText = `${Math.round(coinvestVal)}%`;
+        coinvestIcon = (coinvestVal < TH.coinvestLow) ? '🔻' : '▫️';
+      }
+    }
+  }
+
+  // --- формируем lines (с логикой "нет") ---
+  const lines = [
+    `🏪 Магазин: ${user.shop_name || '—'}`,
+    ` - - - - `,
+    `📆 Общий отчёт за: ${date}`,
+    ` - - - - `,
+    lineCountRub('📦 Заказы', orderedUnits, revenue),
+    ` - - - - `,
+    lineCountRub('📦 Выкуплено', buyoutCount, buyoutAmount),
+    ` - - - - `,
+    lineCountRub('📦 Возвраты', returnsCount, returnsSum),
+    ` - - - - `,
+    lineCountRub('📦 Отмены', cancelsCount, cancelsSum),
+    ` - - - - `,
+    `▫️ Расходы на рекламу:  ${adSpendText}`,
+    `${drrIcon} Д.Р.Р:  ${drrText}`,
+    `${ctrIcon} CTR:  ${ctrText}`,
+    `${coinvestIcon} Соинвест: ${coinvestText}`,
+    `${svdIcon} СВД: ${svdHours != null ? `${svdHours} ч.` : ' -'}`,
+    ` - - - - `,
+    `💰 Маржа: ${fmtMoney(margin)}₽`,
+    ` - - - - `,
+  ];
 
   return lines.map(l => `<code>${esc(l)}</code>`).join('\n');
 }
