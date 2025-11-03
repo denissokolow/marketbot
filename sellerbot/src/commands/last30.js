@@ -1,6 +1,9 @@
 // src/commands/last30.js
 const { sendWelcomeCard } = require('../utils/replies');
-const { makeLast30PerSkuText } = require('../utils/reportLast30Sku');
+const {
+  makeLast30PerSkuText,
+  makeLast30PerSkuMessages, // новая функция для безопасного разбиения на несколько сообщений
+} = require('../utils/reportLast30Sku');
 
 async function fetchTrackedSkus(pool, chatId) {
   // Пытаемся взять только tracked, если колонки нет — берём все SKU
@@ -62,8 +65,27 @@ function register(bot, { pool, logger }) {
         return;
       }
 
-      const text = await makeLast30PerSkuText(user, { trackedSkus, db: pool, chatId });
-      await ctx.reply(text, { parse_mode: 'HTML', disable_web_page_preview: true });
+      // Получаем массив сообщений (чанков), чтобы Телеграм не «ломал» моноширинный шрифт
+      const parts = await makeLast30PerSkuMessages(user, {
+        trackedSkus,
+        db: pool,
+        chatId,
+        // при желании можно настроить:
+        // chunkSize: Number(process.env.LAST30_CHUNK_SIZE || 4),
+        // maxChars: Number(process.env.LAST30_MAX_CHARS || 3500),
+        // repeatHeader: String(process.env.LAST30_REPEAT_HEADER || '0') === '1',
+      });
+
+      if (Array.isArray(parts) && parts.length > 0) {
+        // Отправляем по одному сообщению последовательно
+        for (const html of parts) {
+          await ctx.reply(html, { parse_mode: 'HTML', disable_web_page_preview: true });
+        }
+      } else {
+        // Фолбэк на старую функцию (маловероятно, но на всякий случай)
+        const text = await makeLast30PerSkuText(user, { trackedSkus, db: pool, chatId });
+        await ctx.reply(text, { parse_mode: 'HTML', disable_web_page_preview: true });
+      }
     } catch (e) {
       (logger?.error ? logger.error(e, '/last30 error') : console.error(e));
       await ctx.reply('⚠️ Не удалось сформировать отчёт за последние 30 дней.');

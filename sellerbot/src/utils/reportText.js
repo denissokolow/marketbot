@@ -109,85 +109,91 @@ async function getCostsMapFromDB(db, chatId) {
   }
 }
 
-function normalizeSkuFilter(trackedSkus) {
-  if (!trackedSkus) return null;
-  if (Array.isArray(trackedSkus)) return trackedSkus.map(Number).filter(Number.isFinite);
-  if (typeof trackedSkus === 'string') {
-    return trackedSkus.split(/[,\s]+/).map(Number).filter(Number.isFinite);
+// Все SKU пользователя из shop_products (без колонки tracked)
+async function getAllSkusFromDB(db, chatId) {
+  try {
+    if (!db || !chatId) return [];
+    const r = await db.query(`
+      SELECT sp.sku::bigint AS sku
+        FROM shop_products sp
+        JOIN shops s ON s.id = sp.shop_id
+        JOIN users u ON u.id = s.user_id
+       WHERE u.chat_id = $1
+    `, [chatId]);
+    return (r.rows || []).map(x => Number(x.sku)).filter(Number.isFinite);
+  } catch (e) {
+    if (process.env.DEBUG_TODAY === '1') {
+      console.error('[reportText] getAllSkusFromDB error:', e);
+    }
+    return [];
   }
-  if (typeof trackedSkus === 'number') return [trackedSkus];
+}
+
+// Построение множества фильтра по SKU:
+// null/undefined -> без фильтра; иначе -> Set (в т.ч. пустой Set = «ничего не проходит»)
+function toFilterSet(trackedSkus) {
+  if (trackedSkus == null) return null;
+  if (Array.isArray(trackedSkus)) {
+    return new Set(trackedSkus.map(Number).filter(Number.isFinite));
+  }
+  if (typeof trackedSkus === 'string') {
+    return new Set(trackedSkus.split(/[,\s]+/).map(Number).filter(Number.isFinite));
+  }
+  if (typeof trackedSkus === 'number') return new Set([Number(trackedSkus)]);
   return null;
 }
 
-// ===================== «Заказано» из /v2/posting/fbo/list =====================
-// (как было) — limit/offset; суммируем quantity и price*quantity
-async function getFboOrderedStats({ client_id, api_key, date, trackedSkus = null }) {
-  const from = `${date}T00:00:00.000Z`;
-  const to   = `${date}T23:59:59.999Z`;
-
-  const trackedSet = Array.isArray(trackedSkus) && trackedSkus.length
-    ? new Set(trackedSkus.map(x => Number(x)))
-    : null;
-
-  const limit = 1000;
-  let offset = 0;
-
-  let totalQty = 0;
-  let totalRub = 0;
-
-  for (;;) {
-    const body = {
-      filter: { since: from, status: '', to },
-      limit,
-      offset,
-      translit: true,
-      with: { analytics_data: true, financial_data: true, legal_info: false },
-    };
-
-    const data = await ozRequest({
-      client_id, api_key, endpoint: '/v2/posting/fbo/list', body,
-    });
-
-    const items = Array.isArray(data?.result) ? data.result : [];
-    if (!items.length) break;
-
-    for (const posting of items) {
-      const status = String(posting?.status || '').toLowerCase();
-      if (status === 'cancelled' || status === 'canceled') continue;
-
-      const prods = Array.isArray(posting?.products) ? posting.products : [];
-      const fin   = Array.isArray(posting?.financial_data?.products)
-        ? posting.financial_data.products
-        : [];
-
-      const priceBySku = new Map();
-      for (const f of fin) {
-        const sku = Number(f?.product_id) || 0;
-        if (!sku) continue;
-        const p = Number(f?.price);
-        if (Number.isFinite(p)) priceBySku.set(sku, p);
-      }
-
-      for (const p of prods) {
-        const sku  = Number(p?.sku) || 0;
-        const qnty = Number(p?.quantity) || 0;
-        if (!qnty || !sku) continue;
-        if (trackedSet && !trackedSet.has(sku)) continue;
-
-        let unitPrice = Number(priceBySku.get(sku));
-        if (!Number.isFinite(unitPrice)) unitPrice = Number(p?.price);
-        if (!Number.isFinite(unitPrice)) unitPrice = 0;
-
-        totalQty += qnty;
-        totalRub += unitPrice * qnty;
-      }
-    }
-
-    if (items.length < limit) break;
-    offset += limit;
+// ===================== «Заказано» из /v1/analytics/data (dimension: sku) =====================
+// Суммируем metrics: revenue, ordered_units по SKU. Если передан фильтр — только по ним.
+async function getOrderedFromAnalytics({ client_id, api_key, ymd, trackedSkus = null }) {
+  const trackedSet = toFilterSet(trackedSkus); // Set | null
+  if (trackedSet && trackedSet.size === 0) {
+    // Активный пустой фильтр → ничего не проходит
+    return { ordered_units: 0, revenue: 0 };
   }
 
-  return { ordered_units: totalQty, revenue: Math.round(totalRub * 100) / 100 };
+  let offset = 0;
+  const limit = 1000;
+  let orderedUnits = 0;
+  let revenue = 0;
+
+  while (true) {
+    const resp = await ozRequest({
+      client_id, api_key,
+      endpoint: '/v1/analytics/data',
+      body: {
+        date_from: ymd,
+        date_to:   ymd,
+        metrics:   ['revenue', 'ordered_units'],
+        dimension: ['sku'],
+        sort: [{ key: 'revenue', order: 'DESC' }],
+        limit, offset,
+      },
+    });
+
+    const rows = Array.isArray(resp?.result?.data) ? resp.result.data
+               : Array.isArray(resp?.data)        ? resp.data
+               : [];
+    if (!rows.length) break;
+
+    for (const row of rows) {
+      const dim = row?.dimensions?.[0];
+      const sku = Number(dim?.id);
+      if (trackedSet && (!Number.isFinite(sku) || !trackedSet.has(sku))) continue;
+
+      const m = Array.isArray(row?.metrics) ? row.metrics : [0, 0];
+      revenue      += Number(m[0] || 0);
+      orderedUnits += Number(m[1] || 0);
+    }
+
+    if (rows.length < limit) break;
+    offset += rows.length;
+  }
+
+  return {
+    ordered_units: Math.round(orderedUnits),
+    revenue: Math.round(revenue * 100) / 100,
+  };
 }
 
 // ===================== выкупы из /v3/finance/transaction/list =====================
@@ -195,16 +201,15 @@ async function getBuyoutsFromList({
   client_id, api_key, date_from, date_to, trackedSkus = null, db = null, chatId = null,
 }) {
   let count = 0;
-  let amount = 0;     // ₽
+  let amount = 0;     // ₽ (берём op.amount > 0)
   let buyoutCost = 0; // ₽ себестоимость
 
-  const skuFilterArray = normalizeSkuFilter(trackedSkus);
-  const skuFilter = skuFilterArray ? new Set(skuFilterArray) : null;
+  const skuFilter = toFilterSet(trackedSkus); // Set | null
 
   const costsMap = await getCostsMapFromDB(db, chatId); // sku -> net
 
   const itemMatchesFilter = (items) => {
-    if (!skuFilter) return true;
+    if (!skuFilter) return true; // фильтр не задан
     if (!Array.isArray(items) || !items.length) return false;
     for (const it of items) {
       const skuNum = Number(it?.sku);
@@ -248,24 +253,34 @@ async function getBuyoutsFromList({
       const items = Array.isArray(op?.items) ? op.items : [];
       if (!itemMatchesFilter(items)) continue;
 
-      const amt = Number(op?.amount ?? 0); // важно: берём amount
+      const amt = Number(op?.amount ?? 0); // важно: amount
       if (amt > 0) {
-        count += 1;
+        // считаем кол-во выкупленных единиц как сумму quantity по items
+        let qtySum = 0;
+        for (const it of items) {
+          const skuNum = Number(it?.sku) || 0;
+          if (skuFilter && !skuFilter.has(skuNum)) continue;
+          const q = Number(it?.quantity || 1);
+          qtySum += Number.isFinite(q) ? q : 1;
+        }
+        count += qtySum;
         amount += amt;
+
         // себестоимость — по всем позициям
         for (const it of items) {
           const skuNum = Number(it?.sku) || 0;
           if (!skuNum) continue;
           if (skuFilter && !skuFilter.has(skuNum)) continue;
           const net = Number(costsMap.get(skuNum) || 0);
-          if (Number.isFinite(net)) buyoutCost += net;
+          if (Number.isFinite(net)) buyoutCost += net * (Number(it?.quantity || 1) || 1);
         }
+
         if (process.env.DEBUG_TODAY === '1' && includedSamples.length < 5) {
           includedSamples.push({
             posting: op?.posting,
             name: op?.operation_type_name,
             amount: amt,
-            items: items.map(i => ({ sku: i?.sku, name: i?.name })),
+            items: items.map(i => ({ sku: i?.sku, name: i?.name, q: i?.quantity })),
           });
         }
       } else if (process.env.DEBUG_TODAY === '1' && skippedSamples.length < 5) {
@@ -307,9 +322,8 @@ async function getReturnsAndCancellations({
   const time_from = isoToSecondZ(date_from); // YYYY-MM-DDTHH:MM:SSZ
   const time_to   = isoToSecondZ(date_to);   // YYYY-MM-DDTHH:MM:SSZ
 
-  const trackedSet = Array.isArray(trackedSkus) && trackedSkus.length
-    ? new Set(trackedSkus.map(Number))
-    : null;
+  // ВАЖНО: даже [] -> активный пустой фильтр
+  const trackedSet = toFilterSet(trackedSkus);
 
   let cancelCount = 0, cancelSum = 0;
   let returnCount = 0, returnSum = 0;
@@ -409,19 +423,26 @@ async function getReturnsAndCancellations({
 async function makeReportText(user, date, opts = {}) {
   const from = `${date}T00:00:00.000Z`;
   const to   = `${date}T23:59:59.999Z`;
-  const trackedSkus = opts.trackedSkus || null;
   const db          = opts.db || null;
   const chatId      = opts.chatId || null;
 
-  // 1) «Заказано» (шт, ₽) — из FBO постингов (как было)
-  const fbo = await getFboOrderedStats({
+  // Если передали trackedSkus — используем.
+  // ИНАЧЕ, если есть db+chatId — подтягиваем все SKU из shop_products (строгий фильтр).
+  // Если db нет — считаем по всем SKU (без фильтра).
+  let trackedSkus = (opts && Object.prototype.hasOwnProperty.call(opts, 'trackedSkus'))
+    ? opts.trackedSkus
+    : (db && chatId) ? await getAllSkusFromDB(db, chatId)
+    : null;
+
+  // 1) «Заказано» (шт, ₽) — ИЗ АНАЛИТИКИ /v1/analytics/data (dimension=sku)
+  const a = await getOrderedFromAnalytics({
     client_id: user.client_id,
     api_key:   user.seller_api,
-    date,
+    ymd: date,
     trackedSkus,
   });
-  const revenueOrdered = Number(fbo?.revenue || 0);
-  const orderedUnits   = Number(fbo?.ordered_units || 0);
+  const revenueOrdered = Number(a?.revenue || 0);
+  const orderedUnits   = Number(a?.ordered_units || 0);
 
   // 2) Возвраты и Отмены — из /v1/returns/list (logistic_return_date + last_id)
   const rc = await getReturnsAndCancellations({
@@ -473,6 +494,7 @@ async function makeReportText(user, date, opts = {}) {
       totals_raw: totals,
       expenses_excl_sale_commission: expenses,
       margin,
+      trackedSkus_info: Array.isArray(trackedSkus) ? { mode: 'DB/opts', count: trackedSkus.length } : { mode: 'all' },
     });
   }
 
@@ -506,7 +528,7 @@ async function makeReportText(user, date, opts = {}) {
   }
   lines.push(' - - - - ');
 
-  // Отмены: "нет" если 0 и по шт, и по ₽ (формат как в твоём варианте — без пробела перед "шт.")
+  // Отмены: "нет" если 0 и по шт, и по ₽
   if (cancelsCount === 0 && cancelsSum === 0) {
     lines.push('📦 Отмены: нет');
   } else {

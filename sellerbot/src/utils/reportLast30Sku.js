@@ -1,6 +1,6 @@
 // src/utils/reportLast30Sku.js
 // Отчёт /last30: последние 30 дней (по вчерашнюю дату) с разбивкой по SKU.
-// Показатели на SKU: Заказано / Выкуплено / Доставляется / Возвраты / Брак / % выкупа / Д.Р.Р / CTR / Расходы / Прибыль / Прибыль на шт. / ROI / ABC.
+// Показатели на SKU: Заказано / Выкуплено / Доставляется / Возвраты / Отмены / Брак / % выкупа / Д.Р.Р / CTR / Расходы / Прибыль / Прибыль на шт. / ROI / ABC.
 // Индикации (ENV-пороги):
 //   MTD_PICKUP_WARN_LT          (default 80)    — если % выкупа ниже → 🔻
 //   MTD_DRR_WARN_GT             (default 10)    — если Д.Р.Р выше   → 🔺
@@ -30,7 +30,6 @@ async function ozonApiRequestCompat({ client_id, api_key, endpoint, body }) {
 }
 
 // ---------- утилиты ----------
-const esc = (s = '') => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 const firstWord = (s = '') => (String(s).trim().split(/\s+/)[0] || '');
 const fmtMoney0 = (n) => Math.round(Number(n) || 0).toLocaleString('ru-RU');
 const includesBrak = (s) => typeof s === 'string' && s.toLowerCase().includes('брак');
@@ -38,6 +37,23 @@ const fmtPct2 = (x) => (x == null || !Number.isFinite(x))
   ? '—'
   : new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(x) + '%';
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// ВАЖНО: внутри <code> держим только «чистый» текст — без эмодзи и невидимых символов.
+function sanitizeCodeText(s = '') {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\u00A0/g, ' ')           // NBSP → обычный пробел
+    .replace(/[\u200B-\u200D\uFE0E\uFE0F]/g, ''); // zero-width/variation selectors
+}
+
+// Эмодзи/иконка СНАРУЖИ, моно-текст ВНУТРИ <code>
+function monoLine(iconOrText, text) {
+  const t = sanitizeCodeText(text);
+  if (iconOrText) return `${iconOrText} <code>${t}</code>`;
+  return `<code>${t}</code>`;
+}
 
 // ---------- DEBUG/ретраи ----------
 const DEBUG_LAST30         = process.env.DEBUG_LAST30 === '1';
@@ -55,9 +71,14 @@ const MTD_PROFIT_PER_UNIT_WARN_LT  = Number(process.env.MTD_PROFIT_PER_UNIT_WARN
 const ABC_A_LIMIT                  = Number(process.env.ABC_A_LIMIT ?? 0.80);
 const ABC_B_LIMIT                  = Number(process.env.ABC_B_LIMIT ?? 0.95);
 
+// ---------- сплит параметры ----------
+const LAST30_CHUNK_SIZE    = Math.max(1, Number(process.env.LAST30_CHUNK_SIZE || 4));     // SKU на сообщение
+const LAST30_MAX_CHARS     = Math.max(1000, Number(process.env.LAST30_MAX_CHARS || 3500)); // лимит символов
+const LAST30_REPEAT_HEADER = String(process.env.LAST30_REPEAT_HEADER || '0') === '1';      // повторять шапку
+
 // ---------- период: последние N дней по вчерашнюю ----------
 function getLastNDaysRange(n = 30) {
-  const ymdTo = getYesterdayISO(); // YYYY-MM-DD (Europe/Moscow → нормализовано в utils/dates)
+  const ymdTo = getYesterdayISO(); // YYYY-MM-DD
   const d = new Date(ymdTo + 'T00:00:00.000Z');
   d.setUTCDate(d.getUTCDate() - (n - 1));
   const y = d.getUTCFullYear();
@@ -89,7 +110,6 @@ function computeAbcByProfit(profitBySkuMap) {
     return out;
   }
   arr.sort((a, b) => b.profit - a.profit);
-
   const out = new Map();
   let cum = 0;
   for (const { sku, profit } of arr) {
@@ -102,10 +122,14 @@ function computeAbcByProfit(profitBySkuMap) {
   }
   return out;
 }
-function abcBadge(cls) {
-  if (cls === 'A') return '▫️ ABC: A';
-  if (cls === 'B') return '▫️ ABC: B';
-  return '❗ ABC: C';
+function abcBadgeText(cls) {
+  if (cls === 'A') return 'ABC: A';
+  if (cls === 'B') return 'ABC: B';
+  return 'ABC: C';
+}
+function abcBadgeIcon(cls) {
+  if (cls === 'C') return '❗️';
+  return '▫️';
 }
 
 // ---------- себестоимость per-unit из БД ----------
@@ -276,13 +300,14 @@ async function fetchFboDeliveringCounts({ client_id, api_key, fromISO, toISO, tr
   return counts;
 }
 
-// ---------- returns: количество + брак ----------
+// ---------- returns: количество + ОТДЕЛЬНО отмены + брак ----------
 async function fetchReturnsStats({ client_id, api_key, fromISO, toISO, trackedSet }) {
   const limit = 500;
   let last_id = 0;
 
-  const counts = new Map();     // sku -> qty
-  const brakCounts = new Map(); // sku -> qty (если причина содержит «брак»)
+  const returnCounts = new Map(); // sku -> qty (ClientReturn)
+  const cancelCounts = new Map(); // sku -> qty (Cancellation)
+  const brakCounts   = new Map(); // sku -> qty (по причине содержит «брак»)
   const seen = new Set();
 
   for (let attempt = 0; ; attempt++) {
@@ -303,25 +328,34 @@ async function fetchReturnsStats({ client_id, api_key, fromISO, toISO, trackedSe
         if (!items.length) break;
 
         for (const rt of items) {
+          // sku
           const sku = Number(rt?.sku ?? rt?.product?.sku ?? rt?.product_id?.sku ?? 0);
           if (!Number.isFinite(sku) || (trackedSet && !trackedSet.has(sku))) continue;
 
+          // уникальность записи
           const id  = rt?.id ?? rt?.return_id ?? rt?.acceptance_id ?? null;
           const pn  = rt?.posting_number || rt?.posting?.posting_number || '';
           const idx = rt?.item_index ?? rt?.item_id ?? rt?.index ?? 0;
           const key = id != null ? `id:${id}` : `pn:${pn}|sku:${sku}|idx:${idx}`;
           if (seen.has(key)) continue; seen.add(key);
 
+          // qty
           const q = Number.isFinite(Number(rt?.quantity))
             ? Number(rt?.quantity)
             : Number.isFinite(Number(rt?.return_count)) ? Number(rt?.return_count)
             : Number.isFinite(Number(rt?.qty)) ? Number(rt?.qty)
             : 1;
 
-          counts.set(sku, (counts.get(sku) || 0) + q);
-
+          // тип и брак
+          const type   = String(rt?.type || '').trim();
           const reason = rt?.return_reason_name || rt?.reason || '';
-          if (includesBrak(reason)) brakCounts.set(sku, (brakCounts.get(sku) || 0) + q);
+
+          if (type === 'ClientReturn') {
+            returnCounts.set(sku, (returnCounts.get(sku) || 0) + q);
+            if (includesBrak(reason)) brakCounts.set(sku, (brakCounts.get(sku) || 0) + q);
+          } else if (type === 'Cancellation') {
+            cancelCounts.set(sku, (cancelCounts.get(sku) || 0) + q);
+          }
         }
 
         const next = Number(result?.last_id ?? 0);
@@ -339,7 +373,7 @@ async function fetchReturnsStats({ client_id, api_key, fromISO, toISO, trackedSe
     }
   }
 
-  return { counts, brakCounts };
+  return { returnCounts, cancelCounts, brakCounts };
 }
 
 // распределение value по SKU на основе весов (Map<sku, weight>)
@@ -354,12 +388,15 @@ function splitByWeights(total, weightsMap) {
   return res;
 }
 
-// ---------- основной рендер ----------
-async function makeLast30PerSkuText(user, { trackedSkus = [], db = null, chatId = null } = {}) {
+// ================== CORE: сбор данных и построение блоков ==================
+async function buildLast30DataAndBlocks(user, { trackedSkus = [], db = null, chatId = null } = {}) {
   // нормализуем tracked
   const tracked = [...new Set((Array.isArray(trackedSkus) ? trackedSkus : [])
     .map(Number).filter(Number.isFinite))];
-  if (!tracked.length) return '<code>Нет отслеживаемых товаров для отчёта.</code>';
+  if (!tracked.length) {
+    const header = monoLine('', 'Нет отслеживаемых товаров для отчёта.');
+    return { headerBlock: header, skuBlocks: [], totalBlock: '', periodStartYmd: '', periodEndYmd: '' };
+  }
   const trackedSet = new Set(tracked);
 
   const { fromYmd, toYmd, fromISO, toISO, periodStartYmd, periodEndYmd } = getLastNDaysRange(30);
@@ -458,7 +495,7 @@ async function makeLast30PerSkuText(user, { trackedSkus = [], db = null, chatId 
     }
   }
 
-  // 4) «доставляется» + «возвраты/брак»
+  // 4) «доставляется» + «возвраты/отмены/брак»
   const [inTransitMap, returnsStats] = await Promise.all([
     fetchFboDeliveringCounts({
       client_id: user.client_id,
@@ -475,7 +512,8 @@ async function makeLast30PerSkuText(user, { trackedSkus = [], db = null, chatId 
       trackedSet,
     }),
   ]);
-  const returnsMap = returnsStats.counts;
+  const returnsMap = returnsStats.returnCounts;
+  const cancelMap  = returnsStats.cancelCounts;
   const brakMap    = returnsStats.brakCounts;
 
   // Веса для кампаний «все товары»: пропорционально брутто-выручке SKU (по финоперациям с items)
@@ -487,38 +525,38 @@ async function makeLast30PerSkuText(user, { trackedSkus = [], db = null, chatId 
 
   // 5) Рекламные метрики per-SKU за период (views/clicks/spent) через Performance
   let ppcBySku = new Map();
-if (db && chatId && typeof perfApi.getPerSkuStatsFromDaily === 'function') {
-  try {
-    const rr = await db.query(`
-      SELECT
-        s.perf_client_id     AS client_id,
-        s.perf_client_secret AS client_secret
-      FROM shops s
-      JOIN users u ON u.id = s.user_id
-      WHERE u.chat_id = $1
-        AND s.perf_client_id     IS NOT NULL
-        AND s.perf_client_secret IS NOT NULL
-      ORDER BY s.created_at DESC NULLS LAST, s.id DESC
-      LIMIT 1
-    `, [chatId]);
+  if (db && chatId && typeof perfApi.getPerSkuStatsFromDaily === 'function') {
+    try {
+      const rr = await db.query(`
+        SELECT
+          s.perf_client_id     AS client_id,
+          s.perf_client_secret AS client_secret
+        FROM shops s
+        JOIN users u ON u.id = s.user_id
+        WHERE u.chat_id = $1
+          AND s.perf_client_id     IS NOT NULL
+          AND s.perf_client_secret IS NOT NULL
+        ORDER BY s.created_at DESC NULLS LAST, s.id DESC
+        LIMIT 1
+      `, [chatId]);
 
-    if (rr.rowCount) {
-      ppcBySku = await perfApi.getPerSkuStatsFromDaily({
-        client_id:  rr.rows[0].client_id,
-        client_secret: rr.rows[0].client_secret,
-        date_from: fromYmd,
-        date_to:   toYmd,
-        trackedSkus: tracked,
-        allocationWeights,
-      });
+      if (rr.rowCount) {
+        ppcBySku = await perfApi.getPerSkuStatsFromDaily({
+          client_id:  rr.rows[0].client_id,
+          client_secret: rr.rows[0].client_secret,
+          date_from: fromYmd,
+          date_to:   toYmd,
+          trackedSkus: tracked,
+          allocationWeights,
+        });
+      }
+    } catch (e) {
+      console.warn('[LAST30] Performance daily per-sku error:', e?.response?.status, e?.message);
+      ppcBySku = new Map();
     }
-  } catch (e) {
-    console.warn('[LAST30] Performance daily per-sku error:', e?.response?.status, e?.message);
-    ppcBySku = new Map();
   }
-}
 
-  // ---------- расчёты по каждому SKU (1-й проход) ----------
+  // ---------- расчёты по каждому SKU ----------
   const orderSkus = [...tracked].sort((a, b) => {
     const ra = Number(agg.get(a)?.grossAccrPos || 0);
     const rb = Number(agg.get(b)?.grossAccrPos || 0);
@@ -526,9 +564,8 @@ if (db && chatId && typeof perfApi.getPerSkuStatsFromDaily === 'function') {
     return a - b;
   });
 
-  const profitBySku = new Map(); // для ABC
-  const perSku      = new Map(); // кеш строк/значений для вывода
-  let totalProfitAfterAds = 0;
+  const profitBySku = new Map();
+  const perSku      = new Map();
 
   for (const sku of orderSkus) {
     const ord = orderedMap.get(sku) || { ordered:0, revenue:0 };
@@ -538,10 +575,9 @@ if (db && chatId && typeof perfApi.getPerSkuStatsFromDaily === 'function') {
     const posCnt   = Math.max(0, a.posCnt);
     const negCnt   = Math.max(0, a.negCnt);
     const netCnt   = Math.max(0, posCnt - negCnt); // выкупленные шт.
-    const grossRev = a.grossAccrPos;               // брутто выручка (Σ accruals_for_sale>0)
-    const expenses = a.expenses;                   // площадочные расходы (комиссии/логистика/услуги/остатки-)
-
-    const costTotal = netCnt * net;                // себестоимость по выкупленным
+    const grossRev = a.grossAccrPos;               // брутто выручка
+    const expenses = a.expenses;                   // площадочные расходы
+    const costTotal = netCnt * net;                // себестоимость
 
     // реклама
     let ctrStr = '—', drrStr = '—', ctr = null, drr = null, adSpend = 0;
@@ -556,22 +592,20 @@ if (db && chatId && typeof perfApi.getPerSkuStatsFromDaily === 'function') {
       drrStr = fmtPct2(drr);
     }
 
-    // прибыль ПОСЛЕ рекламы
     const profitBeforeAds = grossRev - expenses - costTotal;
     const profitAfterAds  = profitBeforeAds - adSpend;
 
-    totalProfitAfterAds += profitAfterAds;
     profitBySku.set(sku, profitAfterAds);
 
     const titleApi = nameBySku.get(sku) || '';
     const display  = firstWord(titleApi) || `SKU ${sku}`;
 
-    // «процент выкупа» для last30 — по заказам (без «доставляется») *в итоговом рендере донастроим
     perSku.set(sku, {
       display, ord,
       grossRev, netCnt,
       inTransitQty: Number(inTransitMap.get(sku) || 0),
       returnsQty: Number(returnsMap.get(sku) || 0),
+      cancelsQty: Number(cancelMap.get(sku) || 0),
       brakQty:    Number(brakMap.get(sku)    || 0),
       ctrStr, drrStr,
       expenses,
@@ -580,27 +614,28 @@ if (db && chatId && typeof perfApi.getPerSkuStatsFromDaily === 'function') {
     });
   }
 
-  // ---------- ABC по прибыли после рекламы ----------
+  // ---------- ABC ----------
   const abcMap = computeAbcByProfit(profitBySku);
 
-  // ---------- вывод ----------
-  const lines = [];
-  lines.push(`<code>🏪 Магазин: ${esc(user.shop_name || 'Неизвестно')}</code>`);
-  lines.push('<code> - - - - </code>');
-  lines.push(`<code>📆 Период: ${esc(periodStartYmd)} → ${esc(periodEndYmd)}</code>`);
-  lines.push('<code> - - - - </code>');
+  // ---------- построение текстовых БЛОКОВ ----------
+  const headerLines = [];
+  headerLines.push(monoLine('🏪', `Магазин: ${user.shop_name || 'Неизвестно'}`));
+  headerLines.push(monoLine('', ' - - - - '));
+  headerLines.push(monoLine('📆', `Период: ${periodStartYmd} → ${periodEndYmd}`));
+  headerLines.push(monoLine('', ' - - - - '));
+  const headerBlock = headerLines.join('\n');
 
   const qtyLine = (n) => Number(n) ? `${Math.round(Number(n)).toLocaleString('ru-RU')} шт.` : 'нет';
   const qtyMoneyLine = (qty, sum) =>
     Number(qty) ? `${Math.round(Number(qty)).toLocaleString('ru-RU')} шт. на ${fmtMoney0(sum)}₽` : 'нет';
 
+  const skuBlocks = [];
   for (const sku of orderSkus) {
     const s = perSku.get(sku);
     if (!s) continue;
-
     const {
       display, ord, grossRev, netCnt,
-      inTransitQty, returnsQty, brakQty,
+      inTransitQty, returnsQty, cancelsQty, brakQty,
       ctrStr, drrStr, expenses, profitAfterAds, costTotal,
     } = s;
 
@@ -633,34 +668,109 @@ if (db && chatId && typeof perfApi.getPerSkuStatsFromDaily === 'function') {
     const ppuIcon    = (profitPerUnit != null && profitPerUnit < MTD_PROFIT_PER_UNIT_WARN_LT) ? '🔻' : '▫️';
 
     const abcClass = abcMap.get(sku) || 'C';
-    const abcStr   = abcBadge(abcClass);
+    const abcIcon  = abcBadgeIcon(abcClass);
+    const abcText  = abcBadgeText(abcClass);
 
-    lines.push(`<code>📦 ${esc(display)} (${sku})</code>`);
-    lines.push(`<code>▫️ Заказано: ${qtyMoneyLine(ord.ordered, ord.revenue)}</code>`);
-    lines.push(`<code>▫️ Выкуплено: ${qtyMoneyLine(netCnt, grossRev)}</code>`);
-    lines.push(`<code>▫️ Доставляется: ${qtyLine(inTransitQty)}</code>`);
-    lines.push(`<code>▫️ Возвраты: ${qtyLine(returnsQty)}</code>`);
-    lines.push(`<code>▫️ Брак (в возвратах): ${qtyLine(brakQty)}</code>`);
-    lines.push(`<code>${pickupIcon} Процент выкупа: ${pickupStr}</code>`);
-    lines.push(`<code>${drrIcon} Д.Р.Р: ${drrStr}</code>`);
-    lines.push(`<code>${ctrIcon} CTR: ${ctrStr}</code>`);
-    lines.push(`<code>▫️ Расходы: ${Number(expenses) ? `${fmtMoney0(expenses)}₽` : 'нет'}</code>`);
-    lines.push(`<code>${profitIcon} Прибыль: ${Number.isFinite(profitAfterAds) ? `${fmtMoney0(profitAfterAds)}₽` : 'нет'}</code>`);
-    lines.push(`<code>${ppuIcon} Прибыль на шт.: ${ppuStr}</code>`);
-    lines.push(`<code>${roiIcon} ROI: ${roiStr}</code>`);
-    lines.push(`<code>${abcStr}</code>`);
-    lines.push('<code> - - - - </code>');
+    const bl = [
+      monoLine('📦', `${display} (${sku})`),
+      monoLine('▫️', `Заказано: ${qtyMoneyLine(ord.ordered, ord.revenue)}`),
+      monoLine('▫️', `Выкуплено: ${qtyMoneyLine(netCnt, grossRev)}`),
+      monoLine('▫️', `Доставляется: ${qtyLine(inTransitQty)}`),
+      monoLine('▫️', `Возвраты: ${qtyLine(returnsQty)}`),
+      monoLine('▫️', `Отмены: ${qtyLine(cancelsQty)}`),
+      monoLine('▫️', `Брак (в возвратах): ${qtyLine(brakQty)}`),
+      monoLine(pickupIcon, `Процент выкупа: ${pickupStr}`),
+      monoLine(drrIcon, `Д.Р.Р: ${drrStr}`),
+      monoLine(ctrIcon, `CTR: ${ctrStr}`),
+      monoLine('▫️', `Расходы: ${Number(expenses) ? `${fmtMoney0(expenses)}₽` : 'нет'}`),
+      monoLine(profitIcon, `Прибыль: ${Number.isFinite(profitAfterAds) ? `${fmtMoney0(profitAfterAds)}₽` : 'нет'}`),
+      monoLine(ppuIcon, `Прибыль на шт.: ${ppuStr}`),
+      monoLine(roiIcon, `ROI: ${roiStr}`),
+      monoLine(abcIcon, abcText),
+      monoLine('', ' - - - - '),
+    ].join('\n');
+
+    skuBlocks.push(bl);
   }
 
   // итог по прибыли — СУММА ПОСЛЕ РЕКЛАМЫ
   const totalProfitAfterAdsFormatted = fmtMoney0(
     [...profitBySku.values()].reduce((a, b) => a + (Number(b) || 0), 0)
   );
-  lines.push(`<code>💰 Общая прибыль: ${totalProfitAfterAdsFormatted}₽</code>`);
+  const totalBlock = monoLine('💰', `Общая прибыль: ${totalProfitAfterAdsFormatted}₽`);
 
+  return { headerBlock, skuBlocks, totalBlock, periodStartYmd, periodEndYmd };
+}
+
+// ================== Публичные функции: текст и массив сообщений ==================
+
+/**
+ * Старое поведение: собрать ВЕСЬ отчёт одной строкой (для обратной совместимости).
+ */
+async function makeLast30PerSkuText(user, opts = {}) {
+  const { headerBlock, skuBlocks, totalBlock } = await buildLast30DataAndBlocks(user, opts);
+  const lines = [headerBlock, ...skuBlocks, totalBlock];
   return lines.join('\n');
 }
 
+/**
+ * Новое поведение: вернуть МАССИВ сообщений (чанков) для безопасной отправки в Telegram.
+ * Опции:
+ *  - chunkSize: сколько SKU-блоков в одном сообщении (default из ENV LAST30_CHUNK_SIZE)
+ *  - maxChars: мягкий лимит символов на сообщение (default из ENV LAST30_MAX_CHARS)
+ *  - repeatHeader: дублировать шапку в каждом сообщении (default из ENV LAST30_REPEAT_HEADER)
+ */
+async function makeLast30PerSkuMessages(user, opts = {}) {
+  const {
+    headerBlock, skuBlocks, totalBlock,
+  } = await buildLast30DataAndBlocks(user, opts);
+
+  const chunkSize   = Math.max(1, Number(opts.chunkSize || LAST30_CHUNK_SIZE));
+  const maxChars    = Math.max(1000, Number(opts.maxChars || LAST30_MAX_CHARS));
+  const repeatHeader = (typeof opts.repeatHeader === 'boolean') ? opts.repeatHeader : LAST30_REPEAT_HEADER;
+
+  const chunks = [];
+  let current = '';
+  let skuInChunk = 0;
+
+  const pushCurrent = () => {
+    if (current.trim().length) {
+      chunks.push(current);
+      current = '';
+      skuInChunk = 0;
+    }
+  };
+
+  // стартуем с шапки
+  current = headerBlock;
+
+  for (let i = 0; i < skuBlocks.length; i++) {
+    const block = skuBlocks[i];
+
+    // по размерам: если этот блок не влезает — пушим текущий и открываем новый
+    const will = (current + '\n' + block).length;
+    if (skuInChunk >= chunkSize || will > maxChars) {
+      pushCurrent();
+      current = repeatHeader ? headerBlock : '';
+    }
+
+    current += (current ? '\n' : '') + block;
+    skuInChunk += 1;
+  }
+
+  // добавляем total в последний чанк; если не влез — отдельным
+  if ((current + '\n' + totalBlock).length > maxChars) {
+    pushCurrent();
+    current = repeatHeader ? headerBlock + '\n' + totalBlock : totalBlock;
+  } else {
+    current += (current ? '\n' : '') + totalBlock;
+  }
+  pushCurrent();
+
+  return chunks;
+}
+
 module.exports = {
-  makeLast30PerSkuText,
+  makeLast30PerSkuText,     // единым сообщением (как раньше)
+  makeLast30PerSkuMessages, // разбиение на несколько сообщений
 };

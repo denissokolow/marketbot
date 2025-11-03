@@ -2,6 +2,10 @@
 // Единая точка формирования "общего отчёта за вчера" (одним сообщением)
 // Формат — как в старом. Есть: Заказы/Выручка, Выкуп/Маржа, Возвраты, Отмены,
 // Расходы на рекламу (Performance API), ДРР, CTR, СВД.
+//
+// ВАЖНО (вариант 1): "Выкуплено ₽" суммируем ТОЛЬКО по тем SKU, где netCnt>0,
+// т.е. где выкупленные ШТУКИ (доставки минус возвратные операции) > 0.
+// Логика агрегирования такая же, как в per-SKU отчёте.
 
 const oz = require('../services/ozon');
 const { getYesterdayISO } = require('../utils/dates');
@@ -41,7 +45,7 @@ async function hasColumn(db, table, column) {
   return rows.length > 0;
 }
 
-// получаем отслеживаемые SKU пользователя; если tracked нет — берём все SKU
+// получаем SKU пользователя из shop_products; если есть колонка tracked — берём только tracked=TRUE
 async function getTrackedSkus(db, chatId) {
   const trackedExists = await hasColumn(db, 'shop_products', 'tracked');
   const sqlBase = `
@@ -90,7 +94,7 @@ async function getFinanceTotals({ client_id, api_key, date_from, date_to }) {
   return resp?.result || null;
 }
 
-// Сумма «расходов» БЕЗ sale_commission (как в /report)
+// Сумма «расходов» БЕЗ sale_commISSION (как в /report)
 function sumExpensesFromTotalsExCommission(totals) {
   if (!totals || typeof totals !== 'object') return 0;
   const fields = [
@@ -134,89 +138,55 @@ async function getCostsMapFromDB(db, chatId) {
     return new Map();
   }
 }
-function normalizeSkuFilter(trackedSkus) {
-  if (!trackedSkus) return null;
-  if (Array.isArray(trackedSkus)) return trackedSkus.map(Number).filter(Number.isFinite);
-  if (typeof trackedSkus === 'string') {
-    return trackedSkus.split(/[,\s]+/).map(Number).filter(Number.isFinite);
-  }
-  if (typeof trackedSkus === 'number') return [trackedSkus];
-  return null;
-}
 
-// ===== выкупы из /v3/finance/transaction/list (как в /report, берём amount>0) =====
-async function getBuyoutsFromList({
-  client_id, api_key, date_from, date_to, trackedSkus = null, db = null, chatId = null,
-}) {
-  let count = 0;
-  let amount = 0;     // ₽
-  let buyoutCost = 0; // ₽ себестоимость
+// ===== "Заказано" за дату, только по нужным SKU (аналитика per SKU) =====
+async function getOrderedForSkus({ client_id, api_key, ymd, trackedSkus }) {
+  const set = new Set((trackedSkus || []).map(Number).filter(Number.isFinite));
+  if (set.size === 0) return { ordered_units: 0, revenue: 0 };
 
-  const skuFilterArray = normalizeSkuFilter(trackedSkus);
-  const skuFilter = skuFilterArray ? new Set(skuFilterArray) : null;
-
-  const costsMap = await getCostsMapFromDB(db, chatId); // sku -> net
-
-  const itemMatchesFilter = (items) => {
-    if (!skuFilter) return true;
-    if (!Array.isArray(items) || !items.length) return false;
-    for (const it of items) {
-      const skuNum = Number(it?.sku);
-      if (skuFilter.has(skuNum)) return true;
-    }
-    return false;
-  };
-
-  let page = 1;
-  const page_size = 1000;
+  let offset = 0;
+  const limit = 1000;
+  let orderedUnits = 0;
+  let revenue = 0;
 
   while (true) {
-    const data = await ozRequest({
-      client_id, api_key, endpoint: '/v3/finance/transaction/list',
+    const resp = await ozRequest({
+      client_id, api_key,
+      endpoint: '/v1/analytics/data',
       body: {
-        filter: {
-          date: { from: date_from, to: date_to },
-          operation_type: [],
-          posting_number: '',
-          transaction_type: 'all',
-        },
-        page, page_size,
+        date_from: ymd,
+        date_to:   ymd,
+        metrics:   ['revenue', 'ordered_units'],
+        dimension: ['sku'],
+        sort: [{ key: 'revenue', order: 'DESC' }],
+        limit, offset,
       },
     });
+    const rows = Array.isArray(resp?.result?.data) ? resp.result.data
+               : Array.isArray(resp?.data)        ? resp.data
+               : [];
+    if (!rows.length) break;
 
-    const ops = data?.result?.operations || [];
-    if (!ops.length) break;
-
-    for (const op of ops) {
-      if (op?.type !== 'orders' || op?.operation_type_name !== 'Доставка покупателю') continue;
-
-      const items = Array.isArray(op?.items) ? op.items : [];
-      if (!itemMatchesFilter(items)) continue;
-
-      const amt = Number(op?.amount ?? 0); // важно: берём amount (как в /report)
-      if (amt > 0) {
-        count += 1;
-        amount += amt;
-        // себестоимость — по всем позициям
-        for (const it of items) {
-          const skuNum = Number(it?.sku) || 0;
-          if (!skuNum) continue;
-          if (skuFilter && !skuFilter.has(skuNum)) continue;
-          const net = Number(costsMap.get(skuNum) || 0);
-          if (Number.isFinite(net)) buyoutCost += net;
-        }
-      }
+    for (const row of rows) {
+      const dim = row?.dimensions?.[0];
+      const sku = Number(dim?.id);
+      if (!Number.isFinite(sku) || !set.has(sku)) continue;
+      const m = Array.isArray(row?.metrics) ? row.metrics : [0, 0];
+      revenue      += Number(m[0] || 0);
+      orderedUnits += Number(m[1] || 0);
     }
 
-    if (ops.length < page_size) break;
-    page += 1;
+    if (rows.length < limit) break;
+    offset += rows.length;
   }
 
-  return { count, amount, buyoutCost };
+  return {
+    ordered_units: Math.round(orderedUnits),
+    revenue: Math.round(revenue * 100) / 100,
+  };
 }
 
-// ===== Возвраты/Отмены из /v1/returns/list (как в /report) =====
-// форма body: { filter: { logistic_return_date: { time_from, time_to } }, limit: 500, last_id }
+// ===== Возвраты/Отмены из /v1/returns/list (как в /report), с фильтром по SKU =====
 function isoToSecondZ(iso) {
   if (!iso) return iso;
   const i = iso.indexOf('.');
@@ -233,8 +203,8 @@ async function getReturnsAndCancellations({
     ? new Set(trackedSkus.map(Number))
     : null;
 
-  let cancelCount = 0, cancelSum = 0;
-  let returnCount = 0, returnSum = 0;
+  let cancelsCount = 0, cancelsSum = 0;
+  let returnsCount = 0, returnsSum = 0;
 
   const limit = 500;
   let last_id = 0;
@@ -279,14 +249,13 @@ async function getReturnsAndCancellations({
       const qty = qtyFromProduct(pr);
 
       if (t === 'ClientReturn') {
-        returnCount += qty;
-        returnSum   += amt;
+        returnsCount += qty;
+        returnsSum   += amt;
       } else if (t === 'Cancellation') {
-        cancelCount += qty;
-        cancelSum   += amt;
+        cancelsCount += qty;
+        cancelsSum   += amt;
       }
 
-      // курсор last_id — берём максимальный
       if (typeof ret?.id === 'number' && ret.id > last_id) last_id = ret.id;
     }
 
@@ -295,10 +264,138 @@ async function getReturnsAndCancellations({
   }
 
   return {
-    returnsCount: Math.round(returnCount),
-    returnsSum: Math.round(returnSum * 100) / 100,
-    cancelsCount: Math.round(cancelCount),
-    cancelsSum: Math.round(cancelSum * 100) / 100,
+    returnsCount: Math.round(returnsCount),
+    returnsSum: Math.round(returnsSum * 100) / 100,
+    cancelsCount: Math.round(cancelsCount),
+    cancelsSum: Math.round(cancelsSum * 100) / 100,
+  };
+}
+
+// ===== Агрегатор ВЫКУПОВ (как в per-SKU), с условиями варианта 1 =====
+// - считаем posCnt (доставки) и negCnt (возвратные операции) по количеству позиций;
+// - распределяем положительный amount пропорционально quantity внутри операции;
+// - СУММИРУЕМ ₽ ТОЛЬКО по тем SKU, где netCnt>0.
+// Возвращаем: { count: нетто-шт., amount: ₽ только по SKU с netCnt>0, buyoutCost: себестоимость по этим шт. }
+async function getBuyoutsTrackedAggregated({
+  client_id, api_key, date_from, date_to, trackedSkus = null, db = null, chatId = null,
+}) {
+  // фильтр по SKU
+  const trackedSet = Array.isArray(trackedSkus) && trackedSkus.length
+    ? new Set(trackedSkus.map(Number).filter(Number.isFinite))
+    : null;
+
+  // себестоимость
+  const costsMap = await getCostsMapFromDB(db, chatId); // sku -> net
+
+  // агрегаторы
+  const posCntBySku = new Map(); // +шт (доставки)
+  const negCntBySku = new Map(); // -шт (возвратные операции)
+  const rubBySku    = new Map(); // ₽ (распределённый положительный amount)
+
+  const page_size = 1000;
+  let page = 1;
+
+  // помощь — распределение total по весам
+  const splitByWeights = (total, weightsMap) => {
+    let totalW = 0; weightsMap.forEach(w => { totalW += w; });
+    if (totalW <= 0) return new Map();
+    const out = new Map();
+    weightsMap.forEach((w, sku) => out.set(sku, (total * w) / totalW));
+    return out;
+  };
+
+  while (true) {
+    const resp = await ozRequest({
+      client_id, api_key,
+      endpoint: '/v3/finance/transaction/list',
+      body: {
+        filter: {
+          date: { from: date_from, to: date_to },
+          operation_type: [],
+          posting_number: '',
+          transaction_type: 'all',
+        },
+        page,
+        page_size,
+      },
+    });
+    const ops = Array.isArray(resp?.result?.operations) ? resp.result.operations : [];
+    if (!ops.length) break;
+
+    for (const op of ops) {
+      const items = Array.isArray(op?.items) ? op.items : [];
+      if (!items.length) continue;
+
+      // соберём веса (quantity) только по нужным SKU
+      const weights = new Map();
+      for (const it of items) {
+        const sku = Number(it?.sku || 0);
+        if (!Number.isFinite(sku)) continue;
+        if (trackedSet && !trackedSet.has(sku)) continue;
+        const q = Number(it?.quantity || 1);
+        const add = Number.isFinite(q) ? q : 1;
+        weights.set(sku, (weights.get(sku) || 0) + add);
+      }
+      if (weights.size === 0) continue;
+
+      const amount = Number(op?.amount || 0);
+      const opType = String(op?.type || '').toLowerCase();
+      const name   = String(op?.operation_type_name || '');
+
+      const isDelivery = (opType === 'orders') && name === 'Доставка покупателю';
+      const isReturnOp = (opType === 'returns') || /возврат/i.test(name);
+
+      // ₽ — только положительный amount распределяем по SKU
+      if (amount > 0) {
+        const parts = splitByWeights(amount, weights);
+        parts.forEach((val, sku) => rubBySku.set(sku, (rubBySku.get(sku) || 0) + val));
+      }
+
+      // шт: + для доставок с положительным amount, − для возвратных операций с отрицательным amount
+      if (amount > 0 && isDelivery) {
+        weights.forEach((w, sku) => posCntBySku.set(sku, (posCntBySku.get(sku) || 0) + w));
+      } else if (amount < 0 && isReturnOp) {
+        weights.forEach((w, sku) => negCntBySku.set(sku, (negCntBySku.get(sku) || 0) + w));
+      }
+    }
+
+    if (ops.length < page_size) break;
+    page += 1;
+  }
+
+  // финальная сводка по SKU с учётом варианта 1
+  let totalUnits = 0;
+  let totalRub   = 0;
+  let totalCost  = 0;
+
+  const allSkus = new Set([
+    ...posCntBySku.keys(),
+    ...negCntBySku.keys(),
+    ...rubBySku.keys(),
+  ]);
+
+  for (const sku of allSkus) {
+    const pos = Number(posCntBySku.get(sku) || 0);
+    const neg = Number(negCntBySku.get(sku) || 0);
+    const netCnt = Math.max(0, pos - neg);
+
+    const rub = Number(rubBySku.get(sku) || 0);
+    const net = Number(costsMap.get(Number(sku)) || 0);
+
+    totalUnits += netCnt;
+
+    // КЛЮЧЕВОЕ: учитываем ₽ ТОЛЬКО если есть нетто-шт (>0)
+    if (netCnt > 0) totalRub += rub;
+
+    if (netCnt > 0 && Number.isFinite(net)) {
+      totalCost += netCnt * net;
+    }
+  }
+
+  return {
+    count: Math.round(totalUnits),
+    amount: Math.round(totalRub * 100) / 100,
+    buyoutCost: Math.round(totalCost * 100) / 100,
   };
 }
 
@@ -493,6 +590,7 @@ async function getSvdHoursForDate({ client_id, api_key }, dateISO, ctx = {}) {
     const x = Number(v);
     if (!Number.isFinite(x)) return null;
     return Math.round(x < 24 ? x * 24 : x);
+    // если API вернул дни — *24; если часы — округляем.
   };
 
   // Вариант A
@@ -565,7 +663,10 @@ const TH = {
 /////////////////////////////////////////////////////////////////////////
 /**
  * Сбор текста "вчера" одним блоком.
- * API/логика выкупа, возвратов и маржи — как в /report.
+ * API/логика выкупа, возвратов и маржи — как в /reportYestSku (per-SKU).
+ * Новое: «Заказы», «Выкуплено», «Возвраты», «Отмены» считаются только по SKU из shop_products.
+ * Если список SKU пуст — используем прежние общие значения как fallback.
+ * ВАРИАНТ 1: "Выкуплено ₽" суммируется только по SKU, где netCnt>0.
  */
 async function makeYesterdaySummaryText(user, ctx = {}) {
   const date = getYesterdayISO();                 // YYYY-MM-DD (Europe/Moscow)
@@ -575,36 +676,51 @@ async function makeYesterdaySummaryText(user, ctx = {}) {
   const client_id = user.client_id;
   const api_key   = user.seller_api;
 
-  // Заказы/выручка (как было)
-  let revenue = 0, orderedUnits = 0;
-  const analyticsRes = await safeCall(
-    oz.getOzonReportFiltered, [0, 0],
-    { client_id, api_key, date, metrics: ['revenue','ordered_units'] }
-  );
-  if (Array.isArray(analyticsRes)) {
-    revenue = Number(analyticsRes[0] || 0);
-    orderedUnits = Number(analyticsRes[1] || 0);
-  } else if (analyticsRes && typeof analyticsRes === 'object') {
-    revenue = Number(analyticsRes.revenue || 0);
-    orderedUnits = Number(analyticsRes.ordered_units || 0);
+  // Получаем список sku из БД (вся таблица; если есть tracked — берём только tracked=TRUE)
+  let trackedSkus = [];
+  if (ctx.db && ctx.chatId) {
+    try { trackedSkus = await getTrackedSkus(ctx.db, ctx.chatId); } catch {}
   }
 
-  // Возвраты и Отмены — как в /report, через /v1/returns/list
+  // === Заказы/выручка: если есть список SKU, суммируем только по ним через /v1/analytics/data (dimension=sku)
+  let revenue = 0, orderedUnits = 0;
+  if (Array.isArray(trackedSkus) && trackedSkus.length) {
+    const a = await getOrderedForSkus({ client_id, api_key, ymd: date, trackedSkus });
+    revenue = Number(a.revenue || 0);
+    orderedUnits = Number(a.ordered_units || 0);
+  } else {
+    // fallback — как было (всё по магазину)
+    const analyticsRes = await safeCall(
+      oz.getOzonReportFiltered, [0, 0],
+      { client_id, api_key, date, metrics: ['revenue','ordered_units'] }
+    );
+    if (Array.isArray(analyticsRes)) {
+      revenue = Number(analyticsRes[0] || 0);
+      orderedUnits = Number(analyticsRes[1] || 0);
+    } else if (analyticsRes && typeof analyticsRes === 'object') {
+      revenue = Number(analyticsRes.revenue || 0);
+      orderedUnits = Number(analyticsRes.ordered_units || 0);
+    }
+  }
+
+  // === Возвраты и Отмены — как в /report, но фильтруем по SKU из БД
   const rcn = await getReturnsAndCancellations({
-    client_id, api_key, date_from: from, date_to: to
+    client_id, api_key, date_from: from, date_to: to, trackedSkus: trackedSkus.length ? trackedSkus : null
   });
   const returnsCount = Number(rcn?.returnsCount || 0);
   const returnsSum   = Number(rcn?.returnsSum   || 0);
   const cancelsCount = Number(rcn?.cancelsCount || 0);
   const cancelsSum   = Number(rcn?.cancelsSum   || 0);
 
-  // Выкуп (шт. и ₽) + себестоимость — как в /report, через /v3/finance/transaction/list
-  const buy = await getBuyoutsFromList({
-    client_id, api_key, date_from: from, date_to: to, db: ctx.db, chatId: ctx.chatId
+  // === Выкуп (шт. и ₽) + себестоимость — как в per-SKU (вариант 1)
+  const buyAgg = await getBuyoutsTrackedAggregated({
+    client_id, api_key, date_from: from, date_to: to,
+    trackedSkus: trackedSkus.length ? trackedSkus : null,
+    db: ctx.db, chatId: ctx.chatId
   });
-  const buyoutCount  = Number(buy?.count || 0);
-  const buyoutAmount = Number(buy?.amount || 0);
-  const buyoutCost   = Number(buy?.buyoutCost || 0);
+  const buyoutCount  = Number(buyAgg?.count || 0);    // нетто-шт
+  const buyoutAmount = Number(buyAgg?.amount || 0);   // ₽ только по SKU с netCnt>0
+  const buyoutCost   = Number(buyAgg?.buyoutCost || 0);
 
   // Финансовая часть (totals) — только РАСХОДЫ БЕЗ sale_commission (как в /report)
   const totals = await getFinanceTotals({ client_id, api_key, date_from: from, date_to: to });
@@ -614,15 +730,14 @@ async function makeYesterdaySummaryText(user, ctx = {}) {
   // margin = buyoutAmount − expenses(excl sale_commission) − returnsSum(ClientReturn) − buyoutCost
   const margin = Math.round((buyoutAmount - expenses - returnsSum - buyoutCost) * 100) / 100;
 
-  // (опционально) отладка
   if (process.env.DEBUG_YEST === '1') {
     console.log('[yesterday-summary]', {
       date, from, to,
+      trackedSkusCount: trackedSkus.length,
       orderedUnits, revenue,
       returnsCount, returnsSum,
       cancelsCount, cancelsSum,
       buyoutCount, buyoutAmount, buyoutCost,
-      totals_raw: totals,
       expenses_excl_sale_commission: expenses,
       margin,
     });
@@ -661,9 +776,9 @@ async function makeYesterdaySummaryText(user, ctx = {}) {
   let coinvestText = '—';
   let coinvestIcon = '▫️';
   if (ctx.db && ctx.chatId) {
-    const trackedSkus = await getTrackedSkus(ctx.db, ctx.chatId);
-    if (trackedSkus.length) {
-      const avg = await fetchSoinvestAvg({ client_id, api_key, trackedSkus });
+    const tracked = trackedSkus && trackedSkus.length ? trackedSkus : await getTrackedSkus(ctx.db, ctx.chatId);
+    if (tracked.length) {
+      const avg = await fetchSoinvestAvg({ client_id, api_key, trackedSkus: tracked });
       if (avg != null) {
         coinvestVal  = Number(avg);
         coinvestText = `${Math.round(coinvestVal)}%`;
@@ -672,7 +787,7 @@ async function makeYesterdaySummaryText(user, ctx = {}) {
     }
   }
 
-  // --- формируем lines (с логикой "нет") ---
+  // --- формируем lines (без лишних пустых строк, как просили) ---
   const lines = [
     `🏪 Магазин: ${user.shop_name || '—'}`,
     ` - - - - `,
